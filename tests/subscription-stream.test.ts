@@ -13,7 +13,7 @@ import { backgroundCaptureDir, backgroundCaptureStream, createBackgroundCapture 
 
 const originalSend = Object.getOwnPropertyDescriptor(process, "send"), originalConnected = Object.getOwnPropertyDescriptor(process, "connected");
 const marker = process.env.LH_DESKTOP_SERVER, secret = process.env.LH_DESKTOP_API_SECRET;
-const xaiKey = process.env.XAI_API_KEY, copilotKey = process.env.COPILOT_GITHUB_TOKEN;
+const xaiKey = process.env.XAI_API_KEY, copilotKey = process.env.COPILOT_GITHUB_TOKEN, anthropicKey = process.env.ANTHROPIC_API_KEY;
 let revision = 1, denied = false, sends = 0;
 const context = normalizeContext({ messages: [{ role: "user", content: "Offline fixture", timestamp: 0 }] });
 function snapshot(background = true): NativeSubscriptionSnapshot {
@@ -25,10 +25,10 @@ function snapshot(background = true): NativeSubscriptionSnapshot {
 const emit = (value: unknown) => (process.emit as (event: string, value: unknown) => boolean)("message", value);
 before(async () => {
 	process.env.LH_DESKTOP_SERVER = "1"; process.env.LH_DESKTOP_API_SECRET = "d".repeat(64);
-	process.env.XAI_API_KEY = "fixture-must-never-be-used"; process.env.COPILOT_GITHUB_TOKEN = "fixture-api-route-only";
+	process.env.XAI_API_KEY = "fixture-must-never-be-used"; process.env.COPILOT_GITHUB_TOKEN = "fixture-api-route-only"; process.env.ANTHROPIC_API_KEY = "fixture-must-never-be-used";
 	Object.defineProperty(process, "connected", { configurable: true, value: true });
 	Object.defineProperty(process, "send", { configurable: true, value: (message: any, callback?: () => void) => {
-		sends++; queueMicrotask(() => emit({ channel: "lh:subscriptions", id: message.id, op: message.op, ...(denied && message.op === "lease" ? { ok: false, error: "fixture expired refresh" } : { ok: true, value: message.op === "snapshot" ? snapshot() : { scope: message.scope, auth: { apiKey: "fixture-oauth-only", ...(message.scope.providerId === "github-copilot" ? { baseUrl: "https://api.business.githubcopilot.com", headers: { "x-fixture-auth": "native-retained" } } : {}) } } }) }));
+		sends++; queueMicrotask(() => emit({ channel: "lh:subscriptions", id: message.id, op: message.op, ...(denied && message.op === "lease" ? { ok: false, error: "fixture expired refresh" } : { ok: true, value: message.op === "snapshot" ? snapshot() : { scope: message.scope, auth: { apiKey: message.scope.providerId === "anthropic" ? "sk-ant-oat01-fixture-oauth-only" : "fixture-oauth-only", ...(message.scope.providerId === "github-copilot" ? { baseUrl: "https://api.business.githubcopilot.com", headers: { "x-fixture-auth": "native-retained" } } : {}) } } }) }));
 		callback?.(); return true;
 	} });
 	await refreshSubscriptionModels();
@@ -36,7 +36,7 @@ before(async () => {
 after(() => {
 	if (originalSend) Object.defineProperty(process, "send", originalSend); else delete process.send;
 	if (originalConnected) Object.defineProperty(process, "connected", originalConnected); else delete (process as { connected?: boolean }).connected;
-	for (const [key, value] of [["LH_DESKTOP_SERVER", marker], ["LH_DESKTOP_API_SECRET", secret], ["XAI_API_KEY", xaiKey], ["COPILOT_GITHUB_TOKEN", copilotKey]]) { if (value === undefined) delete process.env[key!]; else process.env[key!] = value; }
+	for (const [key, value] of [["LH_DESKTOP_SERVER", marker], ["LH_DESKTOP_API_SECRET", secret], ["XAI_API_KEY", xaiKey], ["COPILOT_GITHUB_TOKEN", copilotKey], ["ANTHROPIC_API_KEY", anthropicKey]]) { if (value === undefined) delete process.env[key!]; else process.env[key!] = value; }
 });
 test("logical subscription routes are separate catalog entries without rewriting native API models", () => {
 	for (const p of NATIVE_SUBSCRIPTIONS) {
@@ -62,12 +62,19 @@ for (const p of NATIVE_SUBSCRIPTIONS) test(`${p.providerId}: every SDK transport
 		const runId = `${p.providerId}-${native.api}`;
 		const capture = createBackgroundCapture({ role: "researcher", runId })!;
 		const result = await backgroundCaptureStream(engine.streamFn, capture)(engine.model, context, {
+			...(p.providerId === "anthropic" ? { sessionId: "claude-replay-fixture" } : {}),
 			onPayload: (raw, selected) => { payloadObserved = true; assert.equal(selected.provider, p.providerId); return { ...raw as object, model: "caller-cannot-replace-selected" }; },
 			fetch: async (input, init) => {
 				requests++; const request = new Request(input, init), body = await request.json(); actualBody = body;
-				assert.equal(request.headers.get("authorization"), "Bearer fixture-oauth-only");
+				assert.equal(request.headers.get("authorization"), `Bearer ${p.providerId === "anthropic" ? "sk-ant-oat01-fixture-oauth-only" : "fixture-oauth-only"}`);
 				assert.equal(body.model, native.id);
 				if (p.providerId === "github-copilot") { assert.equal(new URL(request.url).origin, "https://api.business.githubcopilot.com"); assert.equal(request.headers.get("x-fixture-auth"), "native-retained"); }
+				else if (p.providerId === "anthropic") {
+					assert.equal(new URL(request.url).origin, "https://api.anthropic.com");
+					assert.equal(request.headers.get("x-api-key"), null, "the subscription must never ride the API-key header");
+					assert.match(request.headers.get("anthropic-beta") ?? "", /oauth-2025-04-20/);
+					assert.equal("thread" in body, false, "rotating OAuth credentials keep full replay, never server-side threads");
+				}
 				else assert.equal(new URL(request.url).origin, "https://api.x.ai");
 				return new Response('{"error":{"message":"private-fixture-provider-detail"}}', { status: 401, headers: { "content-type": "application/json" } });
 			},
@@ -76,7 +83,9 @@ for (const p of NATIVE_SUBSCRIPTIONS) test(`${p.providerId}: every SDK transport
 		assert(!result.errorMessage?.includes("private-fixture-provider-detail")); assert(result.errorMessage?.includes("No API-key fallback"));
 		capture.reply(result); capture.finish();
 		const record = JSON.parse(fs.readFileSync(path.join(dir, `researcher-${runId}.json`), "utf8"));
-		assert.deepEqual(record.request.payload, actualBody, "Observe after the selected model is enforced, not the caller replacement");
+		// The Anthropic SDK moves `betas` out of the body into the anthropic-beta header; everything else is sent verbatim.
+		const recorded = p.providerId === "anthropic" ? Object.fromEntries(Object.entries(record.request.payload).filter(([key]) => key !== "betas")) : record.request.payload;
+		assert.deepEqual(recorded, actualBody, "Observe after the selected model is enforced, not the caller replacement");
 		assert.equal(record.request.model.provider, p.logicalId);
 		assert(!JSON.stringify(record).includes("fixture-oauth-only"));
 		assert(!JSON.stringify(record).includes("native-retained"));
