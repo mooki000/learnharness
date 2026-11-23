@@ -40,8 +40,7 @@ async function loadSubscriptionSDK(baseDirectory) {
 }
 function validEndpoint(providerId, auth, credential) {
 	if (!auth || (!(typeof auth.apiKey === "string" && auth.apiKey.length > 0) && !Object.entries(auth.headers ?? {}).some(([key, value]) => ["authorization", "x-api-key", "api-key"].includes(key.toLowerCase()) && typeof value === "string" && value.trim().length > 0))) return false;
-	// Claude's subscription must stay an OAuth bearer: Pi treats any other string as an ordinary API key, which would silently bill the API instead.
-	if (providerId === "anthropic" && !(typeof auth.apiKey === "string" && auth.apiKey.includes("sk-ant-oat"))) return false;
+	// Bearer shape is validBearer's job: a token-format change must read as "refresh needed", never as a fatal storage error.
 	const value = auth.baseUrl ?? DEFAULT_BASE[providerId];
 	if (!safeHttps(value)) return false;
 	const url = new URL(value);
@@ -50,6 +49,8 @@ function validEndpoint(providerId, auth, credential) {
 	const domain = credential?.enterpriseUrl;
 	return !url.search && !url.hash && url.pathname === "/" && (!url.port || url.port === "443") && (url.hostname.endsWith(".githubcopilot.com") || (domain && (url.hostname === domain || url.hostname.endsWith(`.${domain}`))));
 }
+/** Claude's subscription must stay an OAuth bearer: Pi treats any other string as an ordinary API key (x-api-key), which would silently bill the API. Checked at login and lease time only. */
+function validBearer(providerId, auth) { return providerId !== "anthropic" || (typeof auth?.apiKey === "string" && auth.apiKey.includes("sk-ant-oat")); }
 /** Main owns durable credentials and refresh. Everything returned by status/snapshot is explicitly projected. */
 function createSubscriptions(options) {
 	let sdk;
@@ -177,7 +178,7 @@ function createSubscriptions(options) {
 			}, { agentName: "LearnHarness" });
 			if (!active()) throw failure("cancel"); validateCredential(providerId, credential);
 			const auth = await entry.provider.auth.oauth.toAuth(credential);
-			if (!validEndpoint(providerId, auth, credential) || !active()) throw failure("login");
+			if (!validEndpoint(providerId, auth, credential) || !validBearer(providerId, auth) || !active()) throw failure("login");
 			await serialized(entry, async () => {
 				if (!active() || entry.fatal) throw failure("cancel");
 				attempt.committing = true; entry.blocked = true; entry.epoch++; changed(entry);
@@ -199,7 +200,7 @@ function createSubscriptions(options) {
 			if (!model) throw failure("stale");
 			const resolved = await entry.models.getAuth(model);
 			if (!unchanged()) throw failure("stale");
-			if (!validEndpoint(entry.providerId, resolved?.auth, entry.state.credential)) throw failure("unavailable");
+			if (!validEndpoint(entry.providerId, resolved?.auth, entry.state.credential) || !validBearer(entry.providerId, resolved?.auth)) throw failure("unavailable");
 			return {
 				...(typeof resolved.auth.apiKey === "string" ? { apiKey: resolved.auth.apiKey } : {}),
 				...(resolved.auth.headers ? { headers: Object.fromEntries(Object.entries(resolved.auth.headers).filter(([, value]) => value === null || typeof value === "string")) } : {}),
@@ -253,4 +254,4 @@ function createSubscriptions(options) {
 		close() { closed = true; for (const entry of entries.values()) { cancel(entry.providerId); entry.epoch++; changed(entry); } },
 	};
 }
-module.exports = { createSubscriptions, loadSubscriptionSDK, publicError, validEndpoint, LABELS };
+module.exports = { createSubscriptions, loadSubscriptionSDK, publicError, validEndpoint, validBearer, LABELS };

@@ -11,7 +11,7 @@ import { xaiProvider } from "@earendil-works/pi-ai/providers/xai";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import type { NativeSubscriptionScope } from "../src/core/contracts/subscriptions.ts";
 const require = createRequire(import.meta.url);
-const { createSubscriptions, loadSubscriptionSDK, validEndpoint, publicError } = require("../electron/subscriptions.cjs");
+const { createSubscriptions, loadSubscriptionSDK, validEndpoint, validBearer, publicError } = require("../electron/subscriptions.cjs");
 const { fileStore, validateState } = require("../electron/subscription-store.cjs");
 const { subscriptionControl } = require("../electron/subscription-ipc.cjs");
 const ids = ["github-copilot", "xai", "anthropic"] as const;
@@ -212,18 +212,38 @@ test("enterprise domains are preserved; derived endpoints and control errors are
 });
 interface ClaudeStatus { providerId: string; connected: boolean; interaction?: { attemptId: string; browser?: { id: string; url: string }; prompt?: { id: string; type: string; options?: { id: string }[] } } }
 const claudeStatus = async (controller: { status(): Promise<ClaudeStatus[]> }) => (await controller.status()).find((s) => s.providerId === "anthropic")!;
-test("Claude subscription stays an OAuth bearer: other token shapes and endpoints are refused before storage or dispatch", async () => {
+test("Claude subscription stays an OAuth bearer: other token shapes are refused at login and lease, endpoints are pinned", async () => {
 	const value = credential("anthropic");
 	assert(validEndpoint("anthropic", { apiKey: value.access }, value));
 	assert(validEndpoint("anthropic", { apiKey: value.access, baseUrl: "https://api.anthropic.com" }, value));
-	// Pi sends any non-OAuth string as x-api-key, which would silently bill the API instead of the subscription.
-	for (const auth of [{ apiKey: "sk-ant-api03-fixture-api-key" }, { headers: { Authorization: `Bearer ${value.access}` } }, {}]) assert(!validEndpoint("anthropic", auth, value));
 	for (const baseUrl of ["http://api.anthropic.com", "https://attacker.example", "https://api.anthropic.com/v1", "https://user:pass@api.anthropic.com", "https://api.anthropic.com/?x=1"]) assert(!validEndpoint("anthropic", { apiKey: value.access, baseUrl }, value));
+	// Pi sends any non-OAuth string as x-api-key, which would silently bill the API instead of the subscription.
+	assert(validBearer("anthropic", { apiKey: value.access })); assert(validBearer("xai", { apiKey: "fixture-xai-access" }));
+	for (const auth of [{ apiKey: "sk-ant-api03-fixture-api-key" }, { headers: { Authorization: `Bearer ${value.access}` } }, {}]) assert(!validBearer("anthropic", auth));
 	const f = await fixture({ login: async (id) => ({ ...credential(id), access: "sk-ant-api03-fixture-api-key" }) });
 	try {
 		await assert.rejects(f.controller.login("anthropic"));
 		await assert.rejects(fs.readFile(path.join(f.directory, "anthropic-credentials.json")), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
 		assert.equal((await claudeStatus(f.controller)).connected, false);
+	} finally { await f.cleanup(); }
+});
+test("a saved Claude credential whose token format changed is a recoverable refresh error, not a fatal storage failure", async () => {
+	const f = await fixture();
+	try {
+		await fileStore(path.join(f.directory, "anthropic-credentials.json"), "anthropic").write({ version: 1, allowBackgroundUse: true, connectionId: "b5ac22b7-dfe3-4e52-ae0a-6da2990d4aef", credential: { ...credential("anthropic"), access: "drifted-token-format" } });
+		const reloaded = createSubscriptions({ directory: f.directory, sdk: f.sdk, openExternal: async () => {} }); await reloaded.ready;
+		const statusOf = async () => (await reloaded.status()).find((s: { providerId: string }) => s.providerId === "anthropic");
+		try {
+			const status = await statusOf();
+			assert(status.available && status.connected, "startup must not treat the saved credential as a storage failure");
+			const scope = { providerId: "anthropic", connectionId: status.connectionId, epoch: status.epoch, authorityRevision: status.authorityRevision, selectedModelId: (await reloaded.snapshot()).models.anthropic[0].id };
+			await assert.rejects(reloaded.lease(scope, false), (error: { code?: string }) => error.code === "refresh");
+			const failed = await statusOf();
+			assert(failed.available); assert(!failed.connected); assert.match(failed.error, /could not be refreshed/);
+			await reloaded.login("anthropic");
+			const recovered = await statusOf();
+			assert(recovered.connected); assert.equal(recovered.error, undefined);
+		} finally { reloaded.close(); }
 	} finally { await f.cleanup(); }
 });
 test("Claude login exposes only the method choice, an opaque browser action without OAuth parameters, and the pasted-code prompt", async () => {
