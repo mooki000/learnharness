@@ -21,6 +21,7 @@ import { clampThinkingLevel, getSupportedThinkingLevels, type Api, type Model } 
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { piModels } from "../agent/models.ts";
+import { withOpenAIModelBackports } from "../agent/openai-model-backports.ts";
 import { customProviderAvailable } from "./custom-provider.ts";
 import { chatGPTConnected, chatGPTModel, chatGPTModels, refreshChatGPTModels } from "../agent/chatgpt-bridge.ts";
 import { NATIVE_SUBSCRIPTIONS } from "../core/contracts/subscriptions.ts";
@@ -28,8 +29,8 @@ import { nativeSubscriptionId, nativeSubscriptionConnected, nativeSubscriptionMo
 
 export async function refreshConnectionCatalog(provider?: string): Promise<void> {
 	await Promise.all([
-		// The subscription bridge still trusts only the bundled OpenAI catalog.
-		!provider || provider === "chatgpt" ? refreshChatGPTModels(getBuiltinModels("openai").filter((m): m is Model<"openai-responses"> => m.api === "openai-responses")) : Promise.resolve(),
+		// Subscription eligibility remains the intersection of account offers and known Responses metadata.
+		!provider || provider === "chatgpt" ? refreshChatGPTModels(withOpenAIModelBackports(getBuiltinModels("openai")).filter((m): m is Model<"openai-responses"> => m.api === "openai-responses")) : Promise.resolve(),
 		!provider || nativeSubscriptionId(provider) ? refreshSubscriptionModels() : Promise.resolve(),
 	]);
 }

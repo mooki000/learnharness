@@ -9,6 +9,8 @@ import { backgroundCaptureDir, backgroundCaptureStream, createBackgroundCapture 
 import { piModels, piEngineForSpec } from "../src/agent/models.ts";
 import { chatGPTAbortController, chatGPTModels, refreshChatGPTModels } from "../src/agent/chatgpt-bridge.ts";
 import { chatGPTHistory, chatGPTPayload } from "../src/agent/chatgpt-stream.ts";
+import { resolveConversationSpec } from "../src/core/settings-resolution.ts";
+import { parseSettingsBody } from "../src/server/settings-body.ts";
 
 const originalSend = Object.getOwnPropertyDescriptor(process, "send");
 const originalConnected = Object.getOwnPropertyDescriptor(process, "connected");
@@ -29,7 +31,7 @@ before(async () => {
 	Object.defineProperty(process, "send", { configurable: true, value: (message: any, callback?: () => void) => {
 		queueMicrotask(() => {
 			ipc({ channel: "lh:chatgpt", id: message.id, op: message.op,
-				...(message.op === "lease" && leaseError ? { ok: false, error: leaseError, stamp: { epoch: 1, authorityRevision: 1, revision: 1 } } : { ok: true, value: message.op === "lease" ? { accessToken: "scratch-oauth-only", accountId: "scratch-account", epoch: 1, authorityRevision: 1, revision: 1 } : { epoch: 1, authorityRevision: 1, revision: 1, status, accountId: "scratch-account", models: [{ id: model.id, name: "Scratch account model" }, { id: "unknown-capabilities", name: "Do not invent capabilities" }] } }),
+				...(message.op === "lease" && leaseError ? { ok: false, error: leaseError, stamp: { epoch: 1, authorityRevision: 1, revision: 1 } } : { ok: true, value: message.op === "lease" ? { accessToken: "scratch-oauth-only", accountId: "scratch-account", epoch: 1, authorityRevision: 1, revision: 1 } : { epoch: 1, authorityRevision: 1, revision: 1, status, accountId: "scratch-account", models: [{ id: model.id, name: "Scratch account model" }, { id: "gpt-6.2-sol", name: "Scratch Sol" }, { id: "unknown-capabilities", name: "Do not invent capabilities" }] } }),
 			});
 		});
 		callback?.(); return true;
@@ -136,6 +138,39 @@ test("consent revocation cancels only applicable background streams and preserve
 test("payload sanitizer omits unsupported fields and rejects unsupported hosted tools", () => {
 	assert.deepEqual(chatGPTPayload({ model: "scratch", input: [], stream: false, store: true, metadata: { test: true }, previous_response_id: "old", background: true }, "scratch"), { model: "scratch", input: [], stream: true, store: false });
 	assert.throws(() => chatGPTPayload({ input: [], tools: [{ type: "tool_search" }] }, "scratch"), /Unsupported/);
+});
+
+test("explicit lesson speeds reach only authorized foreground Responses, with no retry on refusal", async () => {
+	const sol = piModels().getModel("openai", "gpt-6.2-sol") as Model<"openai-responses">;
+	await refreshChatGPTModels([model, sol]);
+	const selected = { provider: "chatgpt", id: sol.id };
+	assert.equal(parseSettingsBody({ model: { ...selected, provider: "openai" }, codexSpeed: "fast" }).ok, false);
+	assert.equal(parseSettingsBody({ model: { ...selected, id: "gpt-6.1-terra" }, codexSpeed: "ultrafast" }).ok, false);
+	requests = [];
+	let background = false;
+	for (const [codexSpeed, wire] of [["fast", "priority"], ["ultrafast", "ultrafast"], [undefined, undefined]] as const) {
+		const parsed = parseSettingsBody({ model: selected, codexSpeed });
+		assert(parsed.ok);
+		const engine = piEngineForSpec(resolveConversationSpec(parsed.settings, null)!, () => background);
+		responseEvents = [complete()];
+		const result = await engine.streamFn(engine.model, context(), {
+			onPayload: (body) => ({ ...body as object, service_tier: "scale" }),
+		}).result();
+		assert.equal(result.stopReason, "stop");
+		assert.equal(requests.at(-1)?.body.service_tier, wire);
+		assert.equal(requests.at(-1)?.authorization, "Bearer scratch-oauth-only");
+	}
+	const engine = piEngineForSpec({ ...selected, codexSpeed: "ultrafast" }, () => background);
+	responseEvents = [{ type: "error", code: "unsupported_service_tier" }];
+	assert.match((await engine.streamFn(engine.model, context()).result()).errorMessage ?? "", /selected speed/);
+	assert.equal(requests.length, 4);
+	// A consented background operation never inherits the lesson speed.
+	ipc({ channel: "lh:chatgpt", kind: "state", stamp: { epoch: 1, authorityRevision: 1, revision: 2 }, status: { ...status, allowBackgroundUse: true }, invalidate: "none" });
+	background = true;
+	responseEvents = [complete()];
+	assert.equal((await engine.streamFn(engine.model, context()).result()).stopReason, "stop");
+	assert.equal(requests.length, 5);
+	assert.equal(requests.at(-1)?.body.service_tier, undefined);
 });
 
 test("native identity/session/cache/fetch and awaited caller observers survive enforcement; terminal outcome exactly once", async () => {

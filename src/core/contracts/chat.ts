@@ -10,6 +10,7 @@ import type { LhMessage } from "../native-messages.ts";
 import type { Phase3 } from "../phases.ts";
 import type { PlanNodeStatus, PlanTree } from "./plan.ts";
 import type { EmissionStats } from "./graph.ts";
+import type { CodexSpeed } from "../codex-speed.ts";
 
 // ─── Chat records (the session store's on-disk format) ───────────────────────
 
@@ -67,6 +68,8 @@ export interface ChatSettings {
 	/** pi thinking level — must be in the chosen model's supported list
 	 *  (getSupportedThinkingLevels; enforced by the settings route). */
 	thinkingLevel?: ThinkingLevel;
+	/** Accelerated ChatGPT speed for foreground lesson turns; omitted is Standard. */
+	codexSpeed?: CodexSpeed;
 }
 
 

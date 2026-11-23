@@ -41,7 +41,11 @@ const TRANSPORTS: Transport[] = [
 	{ provider: "opencode-go", id: "gpt-6-luna", envVar: "OPENCODE_API_KEY", api: "openai-responses", origin: "https://opencode.ai", path: "/inference/go/openai/v1/responses", authHeader: "authorization" },
 	{ provider: "openrouter", id: "openai/gpt-4o-mini", envVar: "OPENROUTER_API_KEY", api: "openai-completions", origin: "https://openrouter.ai", path: "/api/v1/chat/completions", authHeader: "authorization" },
 	{ provider: "openai", id: "gpt-4o-mini", envVar: "OPENAI_API_KEY", api: "openai-responses", origin: "https://api.openai.com", path: "/v1/responses", authHeader: "authorization" },
+	{ provider: "openai", id: "gpt-6.2-sol", envVar: "OPENAI_API_KEY", api: "openai-responses", origin: "https://api.openai.com", path: "/v1/responses", authHeader: "authorization" },
+	{ provider: "openai", id: "gpt-6.2-astra", envVar: "OPENAI_API_KEY", api: "openai-responses", origin: "https://api.openai.com", path: "/v1/responses", authHeader: "authorization" },
 	{ provider: "anthropic", id: "claude-haiku-4-5", envVar: "ANTHROPIC_API_KEY", api: "anthropic-messages", origin: "https://api.anthropic.com", path: "/v1/messages", authHeader: "x-api-key" },
+	{ provider: "anthropic", id: "claude-opus-5-5", envVar: "ANTHROPIC_API_KEY", api: "anthropic-messages", origin: "https://api.anthropic.com", path: "/v1/messages", authHeader: "x-api-key" },
+	{ provider: "anthropic", id: "claude-fable-5-2", envVar: "ANTHROPIC_API_KEY", api: "anthropic-messages", origin: "https://api.anthropic.com", path: "/v1/messages", authHeader: "x-api-key" },
 	{ provider: "google", id: "gemini-2.5-flash", envVar: "GEMINI_API_KEY", api: "google-generative-ai", origin: "https://generativelanguage.googleapis.com", path: "/v1beta/models/gemini-2.5-flash:streamGenerateContent", authHeader: "x-goog-api-key" },
 ];
 

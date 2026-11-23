@@ -13,6 +13,10 @@ Open **Settings → Providers** and configure a connection:
 
 Choose **Strong**, **Cheap**, and **Vision** models in Settings. There are no factory model selections. New sessions start with Strong; background roles use their assigned slots or role overrides. A model selected inside an existing session belongs to that session and does not change background-role choices.
 
+**Claude without the CLI:** add **Anthropic** under **Model API keys** and select an `anthropic` model, such as Claude Opus 5.5 or Fable 5.2. This uses the Anthropic Messages API, is billed separately from Claude Max, and requires the API key's account to have access to the model. Leave Claude Code disabled if you don't want the subprocess route. Use a dev launch environment without Anthropic token or gateway overrides if you intend to use the direct API key.
+
+**GPT-6.2:** Sol and Astra are available on the OpenAI API-key route. The ChatGPT connection only lists them when the signed-in account offers them. On supported ChatGPT models, an existing lesson's model controls show **Standard**, **Fast**, and, where supported by the model, **Ultrafast**. The selection is per session, clears on model change, and applies to foreground lesson requests only. Fast and Ultrafast use more allowance or credits; [account and workspace restrictions](https://learn.chatgpt.com/docs/agent-configuration/speed) apply. A refused request does not retry at another speed or fall back to API billing.
+
 Optional web search supports Tavily, Brave, Exa, Firecrawl, and hosted Ollama search; configure a key for the engine you want to use. Research can still fetch known URLs without a search key. Dictation has its own service key below.
 
 ## Start a session

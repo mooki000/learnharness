@@ -63,3 +63,21 @@ test("account-offered GPT-6.1 Terra resolves from the bundled Responses catalog"
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
  }]);
 });
+
+test("GPT-6.2 is selectable only when the active ChatGPT account offers the exact model", async () => {
+ const first = refreshConnectionCatalog("chatgpt");
+ reply(pending.at(-1), { ...value("B", 10, "B", 3), models: [
+  { id: "gpt-6.2-sol", name: "Account Sol" },
+  { id: "gpt-6.2-astra", name: "Account Astra" },
+  { id: "gpt-6.2-unrecognized", name: "Unknown" },
+ ] });
+ await first;
+ assert.deepEqual(chatGPTModels().map(({ provider, id, name }) => [provider, id, name]), [
+  ["chatgpt", "gpt-6.2-sol", "Account Sol"], ["chatgpt", "gpt-6.2-astra", "Account Astra"],
+ ]);
+ assert.equal(chatGPTScope("gpt-6.2-astra").accountId, "B");
+ const second = refreshConnectionCatalog("chatgpt");
+ reply(pending.at(-1), { ...value("B", 11, "B", 3), models: [{ id: "gpt-6.2-sol", name: "Account Sol" }] });
+ await second;
+ assert.throws(() => chatGPTScope("gpt-6.2-astra"), /catalog is unavailable/);
+});

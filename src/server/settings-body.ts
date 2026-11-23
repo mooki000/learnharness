@@ -33,6 +33,7 @@ import { WRITABLE_TOOL_KEYS } from "../core/pending.ts";
 import { isSearchEngineId, SEARCH_ENGINES } from "../core/search.ts";
 import { isDictationLanguage } from "../core/dictation.ts";
 import { parseFileAccessSettings } from "../core/file-access.ts";
+import { codexSpeedsFor, isCodexSpeed } from "../core/codex-speed.ts";
 
 /** Parsed-or-rejected — `ok: false` carries the 400's error message. */
 export type SettingsBodyResult<T> =
@@ -46,6 +47,7 @@ export function parseSettingsBody(body: unknown): SettingsBodyResult<ChatSetting
 	const raw = body as {
 		model?: { provider?: unknown; id?: unknown };
 		thinkingLevel?: unknown;
+		codexSpeed?: unknown;
 	};
 	const settings: ChatSettings = {};
 	if (raw.model !== undefined) {
@@ -64,6 +66,12 @@ export function parseSettingsBody(body: unknown): SettingsBodyResult<ChatSetting
 			return { ok: false, error: "thinkingLevel must be a string" };
 		}
 		settings.thinkingLevel = raw.thinkingLevel as ThinkingLevel;
+	}
+	if (raw.codexSpeed !== undefined) {
+		if (!isCodexSpeed(raw.codexSpeed) || !codexSpeedsFor(settings.model).includes(raw.codexSpeed)) {
+			return { ok: false, error: "codexSpeed requires a supported ChatGPT model and speed" };
+		}
+		settings.codexSpeed = raw.codexSpeed;
 	}
 	// Wave 7 killed the graph-context injection (owner: zero configuration
 	// beyond chat models — the prober reads its map through tools now); its

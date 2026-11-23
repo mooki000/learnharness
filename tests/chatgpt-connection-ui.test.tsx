@@ -12,6 +12,7 @@ import { SettingsDialogBody } from "../components/settings/settings-dialog.tsx";
 import { KeysSection } from "../components/settings/keys-section.tsx";
 import { ModelControl } from "../components/model-picker.tsx";
 import type { ChatGPTStatus, ChatGPTControlBridge } from "../src/core/index.ts";
+import type { ChatSettings } from "../src/core/contracts/chat.ts";
 import { completedWithin } from "./completion.ts";
 import { InteractionLayersProvider } from "../components/interaction-layers.tsx";
 import { installModalDom } from "./modal-dom.ts";
@@ -567,4 +568,32 @@ test("browser-only sign-in is disabled; foreground toolbar has no plan badge or 
  };
  fixture(connected(false)); await mount(<ModelControl />); assert.match(byTest("stats-model").textContent!, /gpt/i);
  assert(!document.body.textContent?.includes("Using ChatGPT plan")); assert(!document.body.textContent?.includes("Enable background use"));
+});
+
+test("lesson speed is opt-in, persists for the selected ChatGPT model and clears back to Standard", async () => {
+ const model = { provider: "chatgpt", id: "gpt-6.2-sol" };
+ let settings: ChatSettings = { model, thinkingLevel: "high" };
+ globalThis.fetch = async (input, init) => {
+  if (input === "/api/models") return Response.json({
+   models: [{ ...model, name: "GPT-6.2 Sol", supportedLevels: ["low", "high"] }],
+   providers: [], slots: {}, defaults: {},
+  });
+  if (input === "/api/settings") return Response.json({ settings: {} });
+  if (input === "/api/chats/speed-chat") return Response.json({ settings });
+  assert.equal(input, "/api/chats/speed-chat/settings");
+  assert.equal(init?.method, "PUT");
+  settings = JSON.parse(String(init.body));
+  return Response.json({ settings });
+ };
+ fixture(connected());
+ await mount(<ModelControl chatId="speed-chat" />);
+ assert.equal(byTest("stats-speed").getAttribute("aria-label"), "ChatGPT speed: Standard");
+ await click(byTest("stats-speed"));
+ await click(button("Ultrafast", byTest("codex-speed-menu")));
+ assert.deepEqual(settings, { model, thinkingLevel: "high", codexSpeed: "ultrafast" });
+ assert.equal(byTest("stats-speed").getAttribute("aria-label"), "ChatGPT speed: Ultrafast");
+ await click(byTest("stats-speed"));
+ await click(button("Standard", byTest("codex-speed-menu")));
+ assert.deepEqual(settings, { model, thinkingLevel: "high" });
+ assert.equal(byTest("stats-speed").getAttribute("aria-label"), "ChatGPT speed: Standard");
 });

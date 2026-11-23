@@ -23,6 +23,8 @@ import { createClaudeCodeProvider } from "./claude-code/provider.ts";
 import { streamClaudeCode } from "./claude-code/stream.ts";
 import { nativeSubscriptionId, nativeSubscriptionModel } from "./subscription-bridge.ts";
 import { nativeSubscriptionStream } from "./subscription-stream.ts";
+import { withOpenAIModelBackports } from "./openai-model-backports.ts";
+import type { CodexSpeed } from "../core/codex-speed.ts";
 
 /** App identity is immutable and shared by Models and every native Agent.
  * Agent's default Pi attribution otherwise overrides the Models identity. */
@@ -67,13 +69,16 @@ function withCatalogOverlay(provider: Provider): Provider {
 	return {
 		...provider,
 		getModels: () => {
+			const base = provider.getModels();
 			const extra = catalogGlobal[CATALOG_KEY]?.get(provider.id);
-			return extra?.length ? [...provider.getModels(), ...extra] : provider.getModels();
+			const models = extra?.length ? [...base, ...extra] : base;
+			return provider.id === "openai" ? withOpenAIModelBackports(models) : models;
 		},
 		getAllModels: () => {
 			const base = provider.getAllModels?.() ?? provider.getModels();
 			const extra = catalogGlobal[CATALOG_KEY]?.get(provider.id);
-			return extra?.length ? [...base, ...extra] : base;
+			const models = extra?.length ? [...base, ...extra] : base;
+			return provider.id === "openai" ? withOpenAIModelBackports(models) : models;
 		},
 	};
 }
@@ -136,6 +141,7 @@ export interface ResolvedModelSpec {
 	provider: string;
 	id: string;
 	thinkingLevel?: ThinkingLevel;
+	codexSpeed?: CodexSpeed;
 }
 
 /** The first entry of the baked default order the model supports (owner,
@@ -204,7 +210,7 @@ export function piEngineForSpec(spec: ResolvedModelSpec, background: boolean | (
 				return current.streamSimple(permitImages(currentModel), context, { ...requestOptions, reasoning: currentLevel === "off" ? undefined : currentLevel });
 			}
 			const purpose = typeof background === "function" ? background : () => background;
-			const stream = spec.provider === "chatgpt" ? chatGPTStream(purpose, lifecycle) : nativeId ? nativeSubscriptionStream(models.getProvider(nativeId)!, purpose, lifecycle) : models.streamSimple.bind(models);
+			const stream = spec.provider === "chatgpt" ? chatGPTStream(purpose, lifecycle, spec.codexSpeed) : nativeId ? nativeSubscriptionStream(models.getProvider(nativeId)!, purpose, lifecycle) : models.streamSimple.bind(models);
 			// Direct Anthropic auth is resolved per request. Keep full replay: Pi's
 			// message-thread fingerprint does not include that rotating credential.
 			const wireModel = requestModel.provider === "anthropic" && requestModel.api === "anthropic-messages"

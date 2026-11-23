@@ -15,6 +15,9 @@ import { notifySettingsSaved, useSettingsSaved } from "@/components/settings-sig
 import { useModelCatalog } from "@/components/model-catalog";
 export { useModelCatalog } from "@/components/model-catalog";
 import { defaultOrderLevel, populateLevel, THINKING_LABEL } from "@/components/thinking-default";
+import { codexSpeedsFor, isCodexSpeed } from "@/src/core/codex-speed";
+
+const SPEED_LABEL = { standard: "Standard", fast: "Fast", ultrafast: "Ultrafast" } as const;
 
 /** provider:id → known contextWindow over the cached catalog, mirroring
  * the server's catalogContextLimits join. CLI aliases have no global
@@ -46,7 +49,7 @@ export function ModelControl({ chatId, onModelChange }: { chatId?: string; onMod
 	// A successful read with no settings is a legacy session; undefined
 	// means no session record is known yet, not permission to inherit Strong.
 	const [session, setSession] = useState<{ settings?: ChatSettings }>();
-	const [open, setOpen] = useState<"model" | "thinking" | null>(null);
+	const [open, setOpen] = useState<"model" | "thinking" | "speed" | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const containerRef = useRef<HTMLDivElement>(null);
 	const interactions = useInteractionLayers();
@@ -108,6 +111,9 @@ export function ModelControl({ chatId, onModelChange }: { chatId?: string; onMod
 		(m) => m.id === effectiveId && m.provider === effectiveProvider,
 	);
 	const levels = entry?.supportedLevels ?? [];
+	const speeds = chatId ? codexSpeedsFor(entry) : [];
+	const storedSpeed = session?.settings?.codexSpeed;
+	const speed = storedSpeed && speeds.includes(storedSpeed) ? storedSpeed : "standard";
 	// Legacy display (chunk 2 item 4, owner): a record with a model but no
 	// stored level shows the RESOLVED level — the ordering's first supported
 	// — because that is exactly what the engine build would run. Display-
@@ -208,13 +214,14 @@ export function ModelControl({ chatId, onModelChange }: { chatId?: string; onMod
 	const apply = useCallback(
 		(provider: string, id: string, level: ThinkingLevel | undefined) => {
 			if (chatId) {
-				void saveChat({ model: { provider, id }, thinkingLevel: level });
+				const codexSpeed = provider === effectiveProvider && id === effectiveId && speed !== "standard" ? speed : undefined;
+				void saveChat({ model: { provider, id }, thinkingLevel: level, ...(codexSpeed ? { codexSpeed } : {}) });
 			} else {
 				// composeSlotModel's empty-string convention: no level = unset.
 				void save(composeSlotModel(models, "strong", provider, id, level ?? ""));
 			}
 		},
-		[chatId, models, save, saveChat],
+		[chatId, effectiveProvider, effectiveId, models, save, saveChat, speed],
 	);
 
 	// Shortcut seams (keyboard wave A): ⌘K opens the model menu (the
@@ -264,7 +271,7 @@ export function ModelControl({ chatId, onModelChange }: { chatId?: string; onMod
 	// Stale-while-revalidate on manual open too (⌘K covers the keyboard
 	// path above): the cached list shows instantly, the fresh federation
 	// swaps in when it lands.
-	const openMenu = (kind: "model" | "thinking") => {
+	const openMenu = (kind: "model" | "thinking" | "speed") => {
 		setOpen((o) => (o === kind ? null : kind));
 		setError(null);
 		if (kind === "model") refresh();
@@ -300,6 +307,11 @@ export function ModelControl({ chatId, onModelChange }: { chatId?: string; onMod
 					aria-expanded={open === "thinking"}
 				>{effectiveLevel === undefined ? "—" : (THINKING_LABEL[effectiveLevel] ?? effectiveLevel)}</ModelPickerPill>
 			</Hint>
+			{speeds.length > 0 && (
+				<ModelPickerPill data-testid="stats-speed" aria-label={`ChatGPT speed: ${SPEED_LABEL[speed]}`} aria-expanded={open === "speed"} onClick={() => openMenu("speed")}>
+					{SPEED_LABEL[speed]}
+				</ModelPickerPill>
+			)}
 
 			{/* The shared dropdown body (extracted 2026-09-20): the agent
 			    settings' slot selects and the setup dialog use the exact same
@@ -342,6 +354,27 @@ export function ModelControl({ chatId, onModelChange }: { chatId?: string; onMod
 						empty={catalog ? (effectiveId ? `${prettyModel(effectiveId)} has no thinking levels.` : "Pick a model first.") : "Loading…"}
 						footer="Levels this model actually supports"
 					/>
+					{error && <div className="mt-1 text-destructive">{error}</div>}
+				</MenuShell>
+			)}
+			{open === "speed" && entry && speeds.length > 0 && (
+				<MenuShell
+					anchorRef={containerRef}
+					testid="codex-speed-menu" onClose={() => { setOpen(null); return "closed"; }}
+					preferredSide="up"
+					menuClass="flex w-60 flex-col gap-0.5 rounded-xl border bg-card p-2 text-xs shadow-xl"
+				>
+					{(["standard", ...speeds] as const).map((choice) => (
+						<button type="button" key={choice} aria-pressed={choice === speed}
+							className="flex items-center justify-between rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-muted"
+							onClick={() => void saveChat({
+								model: { provider: entry.provider, id: entry.id },
+								thinkingLevel: storedLevel,
+								...(isCodexSpeed(choice) ? { codexSpeed: choice } : {}),
+							})}
+						>{SPEED_LABEL[choice]}{choice === speed && <span aria-hidden>✓</span>}</button>
+					))}
+					<div className="mt-1 border-t px-2 pt-1.5 text-xs text-muted-foreground">Foreground lessons only. Fast and Ultrafast use more plan allowance or credits; availability depends on your account.</div>
 					{error && <div className="mt-1 text-destructive">{error}</div>}
 				</MenuShell>
 			)}

@@ -25,6 +25,7 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ModelRole } from "../../config.ts";
 import type { ChatSettings } from "./contracts/chat.ts";
+import { codexSpeedsFor, type CodexSpeed } from "./codex-speed.ts";
 import type { SearchEngineId } from "./search.ts";
 import {
 	BACKGROUND_MODEL_ROLES,
@@ -65,6 +66,7 @@ export interface EffectiveModelSpec {
 	provider: string;
 	id: string;
 	thinkingLevel?: ThinkingLevel;
+	codexSpeed?: CodexSpeed;
 }
 
 /** The concrete appearance view — same shape as the factory's. */
@@ -119,6 +121,7 @@ export function resolveConversationSpec(
 		provider: model.provider,
 		id: model.id,
 		thinkingLevel: chat?.thinkingLevel ?? strong?.thinkingLevel,
+		...(chat?.codexSpeed && codexSpeedsFor(model).includes(chat.codexSpeed) ? { codexSpeed: chat.codexSpeed } : {}),
 	};
 }
 
