@@ -172,7 +172,7 @@ export function createSideChatService(deps: SideChatDeps): SideChatService {
 			thread = { ...target, open: true, messages: [...target.messages, question] };
 			modelThread = thread;
 		}
-		const lesson = sideChatLessonDocument(record.messages);
+		const lesson = sideChatLessonDocument(record.messages, record.tree);
 		const turns = sideChatModelTurns(modelThread, lesson);
 		if (input.working?.trim()) turns[turns.length - 1]!.text += `\n\nLearner's current working (not submitted):\n${input.working.trim()}`;
 		const instructions = deps.instructions();

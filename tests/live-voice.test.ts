@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { newAnswerResult, newPlanBlockMessage, newThinkingMessage, type LhMessage } from "../src/core/native-messages.ts";
 import type { PlanTree } from "../src/core/contracts/plan.ts";
+import { sideChatLessonDocument } from "../src/core/side-chat.ts";
 import { questionDisplayOptions } from "../src/core/question-core.ts";
 import {
 	CODEX_LIVE_SIGNALING_URL,
@@ -613,4 +614,199 @@ test("createLiveSessionManager seeds Live transport instructions with plan and r
 	assert(capturedInstructions.includes("Learner: Explain て-form please"));
 	assert(capturedInstructions.includes("Tutor: For ichidan verbs, drop る and add て."));
 	await manager.stop("chat_ctx");
+});
+
+test("sideChatLessonDocument includes lesson plan progress and dependencies when tree is provided without spoiling open quiz", () => {
+	const tree: PlanTree = {
+		version: 1,
+		nodes: [
+			{ id: "roles", title: "Particles and grammatical roles" },
+			{ id: "verbs", title: "Verb basics and inflection", summary: "Polite, negative, and past endings." },
+		],
+		edges: [{ from: "roles", to: "verbs" }],
+	};
+	const messages: LhMessage[] = [
+		assistantMessage([
+			{ type: "toolCall", id: "send_1", name: "send_to_user", arguments: { message: "Let's check verb endings." } },
+			{
+				type: "toolCall",
+				id: "quiz_open",
+				name: "quiz",
+				arguments: {
+					type: "check",
+					nodeId: "verbs",
+					question: "Match the verb forms.",
+					options: [{ label: "A", value: "a" }, { label: "B", value: "b" }],
+					correctAnswer: "a",
+					explanation: "SECRET_QUIZ_EXPLANATION",
+				},
+			},
+		], "toolUse"),
+	];
+	const doc = sideChatLessonDocument(messages, tree);
+	assert(doc.includes("### Lesson plan"));
+	assert(doc.includes("- [upcoming] Particles and grammatical roles"));
+	assert(doc.includes("- [current] Verb basics and inflection — Polite, negative, and past endings."));
+	assert(doc.includes("Particles and grammatical roles -> Verb basics and inflection"));
+	assert(!doc.includes("SECRET_QUIZ_EXPLANATION"));
+});
+
+test("createLiveSessionManager routes non-answer spoken questions during an open quiz to sideChats without disturbing the quiz", async () => {
+	let emitWire: (event: LiveWireEvent) => void = () => {};
+	const sentFrames: object[] = [];
+	const frameSent = Promise.withResolvers<void>();
+	const sideCalls: { chatId: string; text: string; anchorId: string }[] = [];
+	let mainTurnCalled = false;
+
+	const messages: LhMessage[] = [
+		{
+			...assistantMessage([
+				{ type: "toolCall", id: "send_v", name: "send_to_user", arguments: { message: "Here is a verb quiz." } },
+				{
+					type: "toolCall",
+					id: "quiz_v",
+					name: "quiz",
+					arguments: {
+						type: "check",
+						nodeId: "verbs",
+						question: "Match each line to its reading.",
+						options: [{ label: "doesn't watch / didn't watch", value: "a" }, { label: "didn't watch / doesn't watch", value: "b" }],
+						correctAnswer: "a",
+						explanation: "SECRET_ANSWER",
+					},
+				},
+			], "toolUse"),
+			id: "msg_seg_1",
+		},
+	];
+
+	const manager = createLiveSessionManager({
+		getChat: () => ({
+			id: "chat_quiz_side",
+			title: "日本語",
+			tree: { version: 1, nodes: [{ id: "verbs", title: "Verb basics" }], edges: [] },
+			messages,
+		}),
+		runChatInput: async () => {
+			mainTurnCalled = true;
+			return new Response("", { status: 200 });
+		},
+		askSideQuestion: async (chatId, text, anchorId) => {
+			sideCalls.push({ chatId, text, anchorId });
+			const ndjson = [
+				JSON.stringify({ type: "text", text: "We have 15 topics in the plan; you're currently on Verb basics." }),
+				JSON.stringify({
+					type: "done",
+					thread: {
+						messages: [{ role: "assistant", text: "We have 15 topics in the plan; you're currently on Verb basics." }],
+					},
+				}),
+			].join("\n") + "\n";
+			return new Response(ndjson, { status: 200, headers: { "Content-Type": "application/x-ndjson" } });
+		},
+		steerChat: async () => "stale",
+		isRunning: () => false,
+		getRunningTurn: () => undefined,
+		getEndpoint: () => undefined,
+		refreshCodex: async () => {},
+		isCodexConnected: () => true,
+		leaseCodexAuth: async () => ({ accessToken: "tok", accountId: "acct" }),
+		watchCodexAbort: () => ({ controller: new AbortController(), release: () => {} }),
+		createTransport: (options) => {
+			emitWire = options.onEvent;
+			return {
+				sdpAnswer: "v=0\r\n",
+				connect: async () => {},
+				send: async (payload) => {
+					sentFrames.push(payload);
+					frameSent.resolve();
+				},
+				close: async () => {},
+			};
+		},
+	});
+
+	await manager.start({ chatId: "chat_quiz_side", sdpOffer: "v=0\r\n" });
+	emitWire({
+		type: "delegation.created",
+		item: { type: "delegation", target: "client", id: "del_side_1", content: [{ type: "input_text", text: "What's in our overall lesson plan?" }] },
+	});
+	await frameSent.promise;
+
+	assert.equal(mainTurnCalled, false);
+	assert.deepEqual(sideCalls, [{ chatId: "chat_quiz_side", text: "What's in our overall lesson plan?", anchorId: "msg_seg_1" }]);
+	assert.deepEqual(sentFrames[0], {
+		type: "delegation.context.append",
+		delegation_item_id: "del_side_1",
+		content: [{ type: "input_text", text: '"Agent Final Message":\n\nWe have 15 topics in the plan; you\'re currently on Verb basics.' }],
+	});
+	await manager.stop("chat_quiz_side");
+});
+
+test("createLiveSessionManager includes plan and recent turns in quiz fallback when sideChats is unavailable", async () => {
+	let emitWire: (event: LiveWireEvent) => void = () => {};
+	const sentFrames: { content?: { text?: string }[] }[] = [];
+	const frameSent = Promise.withResolvers<void>();
+
+	const manager = createLiveSessionManager({
+		getChat: () => ({
+			id: "chat_quiz_fb",
+			title: "日本語",
+			tree: { version: 1, nodes: [{ id: "verbs", title: "Verb basics" }], edges: [] },
+			messages: [
+				{ id: "u1", role: "user", content: "Let's study verb negation.", timestamp: 1 },
+				assistantMessage([
+					{ type: "toolCall", id: "send_v", name: "send_to_user", arguments: { message: "ない marks negation." } },
+					{
+						type: "toolCall",
+						id: "quiz_v",
+						name: "quiz",
+						arguments: {
+							type: "check",
+							nodeId: "verbs",
+							question: "Match the readings.",
+							options: [{ label: "A", value: "a" }, { label: "B", value: "b" }],
+							correctAnswer: "a",
+							explanation: "SECRET",
+						},
+					},
+				], "toolUse"),
+			],
+		}),
+		runChatInput: async () => new Response("", { status: 200 }),
+		steerChat: async () => "stale",
+		isRunning: () => false,
+		getRunningTurn: () => undefined,
+		getEndpoint: () => undefined,
+		refreshCodex: async () => {},
+		isCodexConnected: () => true,
+		leaseCodexAuth: async () => ({ accessToken: "tok", accountId: "acct" }),
+		watchCodexAbort: () => ({ controller: new AbortController(), release: () => {} }),
+		createTransport: (options) => {
+			emitWire = options.onEvent;
+			return {
+				sdpAnswer: "v=0\r\n",
+				connect: async () => {},
+				send: async (payload) => {
+					sentFrames.push(payload as { content?: { text?: string }[] });
+					frameSent.resolve();
+				},
+				close: async () => {},
+			};
+		},
+	});
+
+	await manager.start({ chatId: "chat_quiz_fb", sdpOffer: "v=0\r\n" });
+	emitWire({
+		type: "delegation.created",
+		item: { type: "delegation", target: "client", id: "del_fb_1", content: [{ type: "input_text", text: "What's in our plan?" }] },
+	});
+	await frameSent.promise;
+	const text = sentFrames[0]?.content?.[0]?.text ?? "";
+	assert(text.includes("Lesson plan overview:"));
+	assert(text.includes("Verb basics"));
+	assert(text.includes("Recent conversation:"));
+	assert(text.includes("ない marks negation."));
+	assert(!text.includes("SECRET"));
+	await manager.stop("chat_quiz_fb");
 });

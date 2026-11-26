@@ -14,6 +14,7 @@ import {
 	pendingPluginQuestionOf,
 	type LhMessage,
 } from "../../core/native-messages.ts";
+import { sideSegmentId } from "../../core/side-chat.ts";
 import type { ChatInput } from "../../core/input-events.ts";
 import {
 	nativeSubscriptionConnected,
@@ -25,6 +26,7 @@ import {
 } from "../../agent/subscription-bridge.ts";
 import { handleChatInput } from "../chat-handler.ts";
 import { prepareAndSteerChat } from "../jobs.ts";
+import { sideChats } from "../side-chat.ts";
 import { stores } from "../stores.ts";
 import { isTurnRunning } from "../turn-liveness.ts";
 import { runningTurn } from "../turn-runs.ts";
@@ -68,6 +70,7 @@ export class LiveSessionError extends Error {
 export interface LiveSessionDeps {
 	getChat: (chatId: string) => { id: string; title?: string; kind?: string; tree?: PlanTree; messages: LhMessage[] } | null;
 	runChatInput: (chatId: string, input: ChatInput) => Promise<Response>;
+	askSideQuestion?: (chatId: string, text: string, anchorMessageId: string) => Promise<Response>;
 	steerChat: (chatId: string, text: string) => Promise<"accepted" | "settled" | "stale">;
 	isRunning: (chatId: string) => boolean;
 	getRunningTurn: (chatId: string) => { subscribe(): ReadableStream<Uint8Array> } | undefined;
@@ -148,6 +151,77 @@ async function consumeTurnSse(
 		}
 	} finally {
 		reader.releaseLock();
+	}
+}
+
+async function consumeSideNdjson(stream: ReadableStream<Uint8Array>): Promise<{ text?: string; error?: string }> {
+	const reader = stream.getReader();
+	const decoder = new TextDecoder();
+	let buffer = "";
+	let latestText = "";
+	let errorText: string | undefined;
+	const handleLine = (rawLine: string) => {
+		const trimmed = rawLine.trim();
+		if (!trimmed) return;
+		try {
+			const parsed: unknown = JSON.parse(trimmed);
+			if (typeof parsed !== "object" || parsed === null) return;
+			const event = parsed as {
+				type?: unknown;
+				text?: unknown;
+				error?: unknown;
+				thread?: { messages?: { role?: unknown; text?: unknown; error?: unknown }[] };
+			};
+			if (event.type === "text" && typeof event.text === "string") {
+				latestText = event.text;
+			} else if (event.type === "done" && Array.isArray(event.thread?.messages)) {
+				const last = event.thread.messages.at(-1);
+				if (last?.role === "assistant") {
+					if (typeof last.text === "string" && last.text.trim()) latestText = last.text;
+					if (typeof last.error === "string" && last.error.trim()) errorText = last.error;
+				}
+			} else if (event.type === "error" && typeof event.error === "string") {
+				errorText = event.error;
+			}
+		} catch { /* ignore malformed NDJSON frame */ }
+	};
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			buffer += decoder.decode(value, { stream: true });
+			let idx = buffer.indexOf("\n");
+			while (idx !== -1) {
+				handleLine(buffer.slice(0, idx));
+				buffer = buffer.slice(idx + 1);
+				idx = buffer.indexOf("\n");
+			}
+		}
+		buffer += decoder.decode();
+		if (buffer.trim()) handleLine(buffer);
+	} finally {
+		reader.releaseLock();
+	}
+	return {
+		...(latestText.trim() ? { text: latestText.trim() } : {}),
+		...(errorText ? { error: errorText } : {}),
+	};
+}
+
+function buildPendingFallbackContext(
+	record: { messages: readonly LhMessage[]; tree?: PlanTree },
+	baseHint: string,
+): string {
+	const ctx = extractLiveSessionContext(record);
+	const parts = [baseHint];
+	if (ctx.planSummary) parts.push(`Lesson plan overview:\n${ctx.planSummary}`);
+	if (ctx.recentTurns) parts.push(`Recent conversation:\n${ctx.recentTurns}`);
+	return parts.join("\n\n");
+}
+
+function logLiveDiagnostic(message: string): void {
+	if (process.env.NODE_ENV !== "test") {
+		console.info(message);
 	}
 }
 
@@ -247,6 +321,34 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 			await session.transport.send(buildDelegationContextAppend(delegationItemId, chunk, channel));
 		}
 	}
+	async function answerViaSideChat(
+		chatId: string,
+		record: { messages: readonly LhMessage[]; tree?: PlanTree },
+		text: string,
+	): Promise<string | null> {
+		if (!deps.askSideQuestion) return null;
+		const anchorId = sideSegmentId(record.messages);
+		if (!anchorId) {
+			logLiveDiagnostic(`[live] side-question skipped (${chatId}): no-segment`);
+			return null;
+		}
+		try {
+			const response = await deps.askSideQuestion(chatId, text, anchorId);
+			if (!response.ok || !response.body) {
+				logLiveDiagnostic(`[live] side-question failed (${chatId}): status=${response.status}`);
+				return null;
+			}
+			const result = await consumeSideNdjson(response.body);
+			if (!result.text?.trim()) {
+				logLiveDiagnostic(`[live] side-question empty (${chatId}): hasError=${Boolean(result.error)}`);
+				return null;
+			}
+			return result.text.trim();
+		} catch {
+			logLiveDiagnostic(`[live] side-question threw (${chatId})`);
+			return null;
+		}
+	}
 
 	async function handleDelegation(session: ManagedLiveSession, delegationItemId: string, text: string) {
 		if (session.ended) return;
@@ -270,6 +372,7 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 			if (deps.isRunning(session.chatId)) {
 				const steered = await deps.steerChat(session.chatId, text);
 				if (steered === "accepted") {
+					logLiveDiagnostic(`[live] delegation (${session.chatId}): route=steer`);
 					const handle = deps.getRunningTurn(session.chatId);
 					if (handle) {
 						await consumeTurnSse(handle.subscribe(), sendCommentary);
@@ -285,23 +388,42 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 			}
 
 			if (pendingPluginQuestionOf(recordBefore.messages)) {
-				await sendDelegationText(
-					session,
-					delegationItemId,
-					formatAgentFinalMessage("There is an interactive question card waiting on screen. Ask the learner to complete or dismiss it in the card."),
+				const sideAnswer = await answerViaSideChat(session.chatId, recordBefore, text);
+				if (sideAnswer) {
+					logLiveDiagnostic(`[live] delegation (${session.chatId}): route=side-question (plugin-pending)`);
+					await sendDelegationText(session, delegationItemId, formatAgentFinalMessage(sideAnswer));
+					return;
+				}
+				logLiveDiagnostic(`[live] delegation (${session.chatId}): route=plugin-fallback`);
+				const fallback = buildPendingFallbackContext(
+					recordBefore,
+					"There is an interactive question card waiting on screen. Answer any clarifying or lesson-plan question using the session context below without revealing answers, and remind the learner to complete or dismiss the card on screen.",
 				);
+				await sendDelegationText(session, delegationItemId, formatAgentFinalMessage(fallback));
 				return;
 			}
 
 			const resolution = resolveSpokenInput(recordBefore.messages, text);
 			if (resolution.kind === "quiz-unmatched") {
-				await sendDelegationText(session, delegationItemId, formatAgentFinalMessage(resolution.promptHint));
+				const sideAnswer = await answerViaSideChat(session.chatId, recordBefore, text);
+				if (sideAnswer) {
+					logLiveDiagnostic(`[live] delegation (${session.chatId}): route=side-question (quiz-open)`);
+					await sendDelegationText(session, delegationItemId, formatAgentFinalMessage(sideAnswer));
+					return;
+				}
+				logLiveDiagnostic(`[live] delegation (${session.chatId}): route=quiz-fallback`);
+				await sendDelegationText(
+					session,
+					delegationItemId,
+					formatAgentFinalMessage(buildPendingFallbackContext(recordBefore, resolution.promptHint)),
+				);
 				return;
 			}
 
 			const input: ChatInput = resolution.kind === "answer"
 				? { type: "answer", toolCallId: resolution.toolCallId, answer: resolution.answer }
 				: { type: "text", text };
+			logLiveDiagnostic(`[live] delegation (${session.chatId}): route=${resolution.kind === "answer" ? "quiz-answer" : "main-turn"}`);
 
 			const response = await deps.runChatInput(session.chatId, input);
 			if (!response.ok) {
@@ -374,11 +496,12 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 		const previous = sessions.get(params.chatId);
 		if (previous) await previous.stop();
 
+		const freshRecord = deps.getChat(params.chatId) ?? record;
 		const liveId = randomUUID();
-		const sessionContext = extractLiveSessionContext(record);
+		const sessionContext = extractLiveSessionContext(freshRecord);
 		const instructions = buildTutorLiveInstructions({
-			sessionTitle: record.title,
-			sessionKind: record.kind,
+			sessionTitle: freshRecord.title,
+			sessionKind: freshRecord.kind,
 			...sessionContext,
 		});
 		const sessionAbort = new AbortController();
@@ -428,6 +551,9 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 			if (session.ended) return;
 			switch (event.type) {
 				case "session.started":
+					logLiveDiagnostic(
+						`[live] started (${params.chatId}, remote=${event.session.id}, sentInstr=${instructions.length}, echoedInstr=${event.session.instructions?.length ?? -1}, plan=${sessionContext.planSummary?.length ?? 0}, recent=${sessionContext.recentTurns?.length ?? 0}, active=${sessionContext.activePrompt?.length ?? 0})`,
+					);
 					if (!session.activeDelegationId) setPhase(session, "listening");
 					break;
 				case "input_transcript.added":
@@ -573,6 +699,11 @@ function defaultDeps(): LiveSessionDeps {
 	return {
 		getChat: (chatId) => stores.chatStore.getChat(chatId),
 		runChatInput: (chatId, input) => handleChatInput(chatId, input),
+		askSideQuestion: (chatId, text, anchorMessageId) => sideChats.ask(chatId, {
+			anchor: { messageId: anchorMessageId, partId: `${anchorMessageId}-t0`, blockIndex: 0, blockText: "" },
+			text,
+			quotes: [],
+		}),
 		steerChat: (chatId, text) => prepareAndSteerChat(chatId, { type: "steer", id: `steer_${randomUUID()}`, text }),
 		isRunning: (chatId) => isTurnRunning(chatId),
 		getRunningTurn: (chatId) => runningTurn(chatId),

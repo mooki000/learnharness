@@ -23,6 +23,7 @@
 
 import type { AssistantMessage, ToolResultMessage } from "@earendil-works/pi-ai";
 import type { ChatRecord, SideChatAnchor, SideChatMessage, SideChatThread } from "./contracts/chat.ts";
+import { derivedNodeStatus, derivePlanStatusesLh, type PlanTree } from "./contracts/plan.ts";
 import type { LhMarkerMessage, LhMessage } from "./native-messages.ts";
 import type { LhViewMessage, LhViewPart } from "./view.ts";
 import {
@@ -454,8 +455,36 @@ function problemMarkdown(args: { statement?: unknown } | undefined, open: boolea
  * thinking, answered/open questions and practice problems render; other
  * tool traffic and scaffolding markers do not.
  */
-export function sideChatLessonDocument(messages: readonly LhMessage[]): string {
+export function sideChatLessonDocument(messages: readonly LhMessage[], tree?: PlanTree): string {
 	const blocks: string[] = [];
+	if (tree && tree.nodes.length > 0) {
+		const statuses = derivePlanStatusesLh(tree, messages);
+		const titleById = new Map<string, string>();
+		const lines: string[] = [];
+		for (const node of tree.nodes.slice(0, 30)) {
+			const title = node.title.trim();
+			if (!title) continue;
+			titleById.set(node.id, title);
+			const status = derivedNodeStatus(statuses, node.id);
+			const rawSummary = node.summary?.trim();
+			const summary = rawSummary && rawSummary.length > 140 ? `${rawSummary.slice(0, 139).trimEnd()}…` : rawSummary;
+			lines.push(summary ? `- [${status}] ${title} — ${summary}` : `- [${status}] ${title}`);
+		}
+		if (tree.nodes.length > 30) lines.push(`- … (${tree.nodes.length - 30} more topics)`);
+		const edges = tree.edges
+			.map((edge) => {
+				const from = titleById.get(edge.from);
+				const to = titleById.get(edge.to);
+				return from && to ? `  - ${from} -> ${to}` : null;
+			})
+			.filter((line): line is string => line !== null);
+		if (edges.length > 0) lines.push("Dependencies:", ...edges.slice(0, 40));
+		if (lines.length > 0) {
+			const joined = lines.join("\n");
+			const bounded = joined.length > 2_400 ? `${joined.slice(0, 2_399).trimEnd()}…` : joined;
+			blocks.push(`### Lesson plan\n\n${bounded}`);
+		}
+	}
 	let start = 0;
 	const marker = activeCompactionOf(messages);
 	if (marker) {
