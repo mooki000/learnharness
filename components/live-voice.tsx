@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AudioLinesIcon, CheckIcon, ChevronDownIcon, Loader2Icon, MicIcon, MicOffIcon, SquareIcon } from "lucide-react";
+import { AudioLinesIcon, CheckIcon, ChevronDownIcon, Loader2Icon, MicIcon, MicOffIcon, SquareIcon, XIcon } from "lucide-react";
 import {
 	DEFAULT_LIVE_VOICE,
 	LIVE_VOICES,
@@ -75,6 +75,35 @@ function waitForIceGathering(pc: RTCPeerConnection, timeoutMs: number = ICE_GATH
 	return promise;
 }
 
+async function acquireMicrophone(): Promise<MediaStream> {
+	try {
+		return await navigator.mediaDevices.getUserMedia({
+			audio: {
+				echoCancellation: true,
+				noiseSuppression: true,
+				autoGainControl: true,
+			},
+		});
+	} catch (err) {
+		const name = err instanceof Error ? err.name : "";
+		if (name === "OverconstrainedError" || name === "ConstraintNotSatisfiedError") {
+			return navigator.mediaDevices.getUserMedia({ audio: true });
+		}
+		throw err;
+	}
+}
+
+function formatLiveStartError(err: unknown): string {
+	const name = err instanceof Error ? err.name : "";
+	if (name === "NotAllowedError" || name === "SecurityError") return "Microphone permission denied.";
+	if (name === "NotFoundError" || name === "DevicesNotFoundError") return "No microphone found.";
+	if (name === "NotReadableError" || name === "TrackStartError") return "Microphone is busy or unavailable.";
+	if (name === "OverconstrainedError" || name === "ConstraintNotSatisfiedError") return "Microphone settings unsupported.";
+	const msg = err instanceof Error ? err.message : "Could not start Live voice.";
+	if (/permission|notallowed/i.test(msg)) return "Microphone permission denied.";
+	if (/requested device not found/i.test(msg)) return "No microphone found.";
+	return msg;
+}
 export function useLiveVoice({
 	chatId,
 	onBeforeStart,
@@ -240,13 +269,7 @@ export function useLiveVoice({
 		setMuted(false);
 		setServerPhase("connecting");
 		try {
-			const micStream = await navigator.mediaDevices.getUserMedia({
-				audio: {
-					echoCancellation: true,
-					noiseSuppression: true,
-					autoGainControl: true,
-				},
-			});
+			const micStream = await acquireMicrophone();
 			if (generationRef.current !== gen) {
 				for (const track of micStream.getTracks()) track.stop();
 				return;
@@ -349,8 +372,7 @@ export function useLiveVoice({
 			startingRef.current = false;
 		} catch (err) {
 			if (generationRef.current !== gen) return;
-			const msg = err instanceof Error ? err.message : "Could not start Live voice.";
-			setError(/permission|notallowed/i.test(msg) ? "Microphone permission denied." : msg);
+			setError(formatLiveStartError(err));
 			teardownLocal();
 			setServerPhase("idle");
 			startingRef.current = false;
@@ -547,7 +569,27 @@ export function LiveVoiceBar({ live, disabled = false }: { live: LiveVoiceContro
 }
 
 export function LiveCaptionStrip({ live }: { live: LiveVoiceController }) {
-	if (!live.active) return null;
+	if (!live.active) {
+		if (!live.error) return null;
+		return (
+			<div
+				role="alert"
+				data-testid="live-error-strip"
+				className="pointer-events-auto mb-2 flex items-center gap-2 rounded-xl border border-destructive/40 bg-card/90 px-3 py-1.5 text-xs text-destructive shadow-sm backdrop-blur"
+			>
+				<AudioLinesIcon className="size-3.5 shrink-0" />
+				<p className="min-w-0 flex-1 break-words">{live.error}</p>
+				<button
+					type="button"
+					onClick={live.clearError}
+					aria-label="Dismiss live voice error"
+					className="flex size-5 shrink-0 items-center justify-center rounded text-destructive/80 transition-colors hover:bg-destructive/10 hover:text-destructive"
+				>
+					<XIcon className="size-3" />
+				</button>
+			</div>
+		);
+	}
 	const { transcript, phase } = live;
 	return (
 		<div

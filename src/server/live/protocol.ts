@@ -326,6 +326,9 @@ export function buildTutorLiveInstructions(context: {
 	sessionTitle?: string;
 	sessionKind?: string;
 	hasPendingQuestion?: boolean;
+	planSummary?: string;
+	recentTurns?: string;
+	activePrompt?: string;
 }): string {
 	const topicLine = context.sessionTitle?.trim()
 		? `Current LearnHarness session (${context.sessionKind === "practice" ? "practice" : "teaching"}): ${context.sessionTitle.trim()}.`
@@ -333,17 +336,31 @@ export function buildTutorLiveInstructions(context: {
 	const pendingLine = context.hasPendingQuestion
 		? "There is currently an unanswered question card waiting on screen in this session."
 		: "";
-	return [
+	const sections: string[] = [
 		"You and the LearnHarness tutor backend are ONE single tutor, not two separate assistants.",
 		topicLine,
 		pendingLine,
 		"Always delegate every substantive learner message, lesson request, question, practice prompt, or answer to the client backend so the lesson transcript, knowledge graph, plan, and quiz cards stay accurate.",
-		"If the learner is only greeting you or asking to repeat something you just said aloud, you may answer directly; otherwise create a client delegation immediately.",
+		"If the learner is only greeting you, asking to repeat something just said or shown on screen, or asking where they are in the lesson plan, you may answer directly from the session context below; otherwise create a client delegation immediately.",
 		"If the learner speaks a new request while a turn is already running, create a new delegation to steer the same lesson.",
 		"Keep your spoken responses natural, concise, warm, and speech-friendly. Never read raw markdown syntax, URLs, backticks, or code fences aloud unless explicitly asked.",
 		"Match the language of the lesson naturally: when speaking Japanese (or any target language), pronounce words, example sentences, and phrases clearly and naturally in that language rather than spelling them out in romaji unless asked.",
 		"Treat delegation context as your own internal progress and lesson output. Never refer to a backend, client delegation, tool protocol, or separate assistant.",
 		"Commentary context is quiet progress while you think or prepare a response; you may acknowledge active work briefly without claiming results before they arrive.",
 		'Context beginning with `"Agent Final Message":` is your finished tutor reply for the learner. Present its substance and any posed question naturally in speech as your own words, without mentioning the label.',
-	].filter(Boolean).join("\n");
+	].filter(Boolean);
+	if (context.planSummary?.trim()) {
+		sections.push("", "Lesson plan overview:", context.planSummary.trim());
+	}
+	if (context.activePrompt?.trim()) {
+		sections.push("", "Currently open on screen:", context.activePrompt.trim());
+	}
+	if (context.recentTurns?.trim()) {
+		sections.push(
+			"",
+			"Recent conversation (context only — still delegate new substantive turns and answers to the backend):",
+			context.recentTurns.trim(),
+		);
+	}
+	return sections.join("\n");
 }

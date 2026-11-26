@@ -9,8 +9,8 @@ import {
 	type LiveTranscriptEntry,
 	type LiveVoiceId,
 } from "../../core/contracts/live.ts";
+import type { PlanTree } from "../../core/contracts/plan.ts";
 import {
-	danglingQuestionOf,
 	pendingPluginQuestionOf,
 	type LhMessage,
 } from "../../core/native-messages.ts";
@@ -36,7 +36,12 @@ import {
 	formatAgentFinalMessage,
 	type LiveWireEvent,
 } from "./protocol.ts";
-import { extractAssistantCommentary, extractTurnSpokenSummary, resolveSpokenInput } from "./speech-extract.ts";
+import {
+	extractAssistantCommentary,
+	extractLiveSessionContext,
+	extractTurnSpokenSummary,
+	resolveSpokenInput,
+} from "./speech-extract.ts";
 import {
 	LiveSignalingError,
 	LiveTransport,
@@ -61,7 +66,7 @@ export class LiveSessionError extends Error {
 }
 
 export interface LiveSessionDeps {
-	getChat: (chatId: string) => { id: string; title?: string; kind?: string; messages: LhMessage[] } | null;
+	getChat: (chatId: string) => { id: string; title?: string; kind?: string; tree?: PlanTree; messages: LhMessage[] } | null;
 	runChatInput: (chatId: string, input: ChatInput) => Promise<Response>;
 	steerChat: (chatId: string, text: string) => Promise<"accepted" | "settled" | "stale">;
 	isRunning: (chatId: string) => boolean;
@@ -370,12 +375,12 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 		if (previous) await previous.stop();
 
 		const liveId = randomUUID();
+		const sessionContext = extractLiveSessionContext(record);
 		const instructions = buildTutorLiveInstructions({
 			sessionTitle: record.title,
 			sessionKind: record.kind,
-			hasPendingQuestion: Boolean(danglingQuestionOf(record.messages) || pendingPluginQuestionOf(record.messages)),
+			...sessionContext,
 		});
-
 		const sessionAbort = new AbortController();
 		const codexWatcher = endpoint ? undefined : deps.watchCodexAbort();
 		const onCodexAbort = () => { void session.stop("OpenAI Codex connection changed or disconnected."); };
@@ -616,8 +621,13 @@ export async function handleLiveStartRequest(chatId: string, request: Request): 
 		return Response.json(result);
 	} catch (error) {
 		if (error instanceof LiveSessionError) {
+			if (error.status >= 500) {
+				console.error(`[live] start failed (${chatId}, ${error.status}, ${error.code}): ${error.message}`);
+			}
 			return Response.json({ error: error.message, code: error.code }, { status: error.status });
 		}
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(`[live] start failed (${chatId}, 500, unexpected): ${message}`);
 		return Response.json({ error: "Live Voice failed to start." }, { status: 500 });
 	}
 }

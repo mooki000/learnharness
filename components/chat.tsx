@@ -2100,7 +2100,7 @@ export function Chat({
 					cliContextWindow={cliContextWindowOf(nativeMessages)}
 					pricing={pricing}
 					onReserve={setDockReserve}
-					liveBanner={liveVoice.active ? <LiveCaptionStrip live={liveVoice} /> : undefined}
+					liveBanner={liveVoice.active || liveVoice.error ? <LiveCaptionStrip live={liveVoice} /> : undefined}
 					dictationSlot={
 						liveVoice.active ? (
 							<LiveVoiceBar live={liveVoice} />

@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { LhMessage } from "../src/core/native-messages.ts";
+import { newAnswerResult, newPlanBlockMessage, newThinkingMessage, type LhMessage } from "../src/core/native-messages.ts";
+import type { PlanTree } from "../src/core/contracts/plan.ts";
 import { questionDisplayOptions } from "../src/core/question-core.ts";
 import {
 	CODEX_LIVE_SIGNALING_URL,
 	DELEGATION_CHUNK_MAX_BYTES,
 	buildCodexSidebandUrl,
 	buildFallbackAttestation,
+	buildTutorLiveInstructions,
 	chunkUtf8,
 	extractAccountIdFromJwt,
 	extractCallIdFromLocation,
@@ -15,6 +17,7 @@ import {
 } from "../src/server/live/protocol.ts";
 import {
 	extractAssistantCommentary,
+	extractLiveSessionContext,
 	extractTurnSpokenSummary,
 	resolveSpokenInput,
 } from "../src/server/live/speech-extract.ts";
@@ -24,7 +27,6 @@ import {
 	type LiveSidebandSocket,
 } from "../src/server/live/transport.ts";
 import { createLiveSessionManager, LiveSessionError } from "../src/server/live/session-manager.ts";
-
 const FAKE_JWT = `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify({
 	"https://api.openai.com/auth": { chatgpt_account_id: "acct_live_123" },
 })).toString("base64url")}.sig`;
@@ -390,4 +392,225 @@ test("createLiveSessionManager bridges delegation.created into tutor turns and s
 	}
 	assert(sseText.includes('"type":"ended"'));
 	assert.equal(manager.activeLiveId("chat_jp"), undefined);
+});
+
+test("extractLiveSessionContext captures plan progress, recent turns, and active prompt without leaking answers", () => {
+	const tree: PlanTree = {
+		version: 1,
+		nodes: [
+			{ id: "particles", title: "Particles は vs が", summary: "Topic marker versus grammatical subject." },
+			{ id: "te-form", title: "Te-form conjugation", summary: "Linking actions and making polite requests." },
+			{ id: "potential", title: "Potential form" },
+		],
+		edges: [
+			{ from: "particles", to: "te-form" },
+			{ from: "te-form", to: "potential" },
+		],
+	};
+
+	const messages: LhMessage[] = [
+		{ id: "u1", role: "user", content: "Let's practice Japanese particles and te-form.", timestamp: 1 },
+		assistantMessage([
+			{ type: "toolCall", id: "send_1", name: "send_to_user", arguments: { message: "Let's start with は vs が." } },
+			{
+				type: "toolCall",
+				id: "quiz_1",
+				name: "quiz",
+				arguments: {
+					nodeId: "particles",
+					question: "Which marks the topic?",
+					options: [{ label: "は", value: "wa" }, { label: "が", value: "ga" }],
+					correctAnswer: "wa",
+					explanation: "は marks the topic.",
+				},
+			},
+		], "toolUse"),
+		newAnswerResult("quiz_1", "quiz", {
+			kind: "quiz",
+			questionText: "Which marks the topic?",
+			dontKnow: false,
+			answers: [{ index: 0, label: "は", value: "wa" }],
+			correct: true,
+			answeredAt: "2026-11-26T00:00:00.000Z",
+		}),
+		assistantMessage([
+			{ type: "toolCall", id: "send_2", name: "send_to_user", arguments: { message: "Nice! Now let's move to te-form." } },
+		], "toolUse"),
+		assistantMessage([
+			{
+				type: "toolCall",
+				id: "quiz_2",
+				name: "quiz",
+				arguments: {
+					nodeId: "te-form",
+					question: "What is the te-form of 食べる?",
+					options: [{ label: "食べて", value: "tabete" }, { label: "食べって", value: "tabette" }],
+					correctAnswer: "tabete",
+					explanation: "SECRET_EXPLANATION_DO_NOT_LEAK",
+				},
+			},
+		], "toolUse"),
+	];
+
+	const snapshot = extractLiveSessionContext({ tree, messages });
+	assert.equal(snapshot.hasPendingQuestion, true);
+	assert(snapshot.planSummary?.includes("- [visited] Particles は vs が — Topic marker versus grammatical subject."));
+	assert(snapshot.planSummary?.includes("- [current] Te-form conjugation — Linking actions and making polite requests."));
+	assert(snapshot.planSummary?.includes("- [upcoming] Potential form"));
+	assert(snapshot.planSummary?.includes("Particles は vs が -> Te-form conjugation"));
+	assert(snapshot.planSummary?.includes("Te-form conjugation -> Potential form"));
+	assert(snapshot.recentTurns?.includes("Learner: Let's practice Japanese particles and te-form."));
+	assert(snapshot.recentTurns?.includes("Tutor: Let's start with は vs が."));
+	assert(snapshot.recentTurns?.includes("Learner: [answered question] は (correct)"));
+	assert(snapshot.recentTurns?.includes("Tutor: Nice! Now let's move to te-form."));
+	assert(snapshot.activePrompt?.includes("Question: What is the te-form of 食べる?"));
+	assert(snapshot.activePrompt?.includes("食べて"));
+	assert(!snapshot.activePrompt?.includes("SECRET_EXPLANATION_DO_NOT_LEAK"));
+	assert(!snapshot.recentTurns?.includes("SECRET_EXPLANATION_DO_NOT_LEAK"));
+
+	const instructions = buildTutorLiveInstructions({
+		sessionTitle: "Japanese N4",
+		sessionKind: "teach",
+		...snapshot,
+	});
+	assert(instructions.includes("Lesson plan overview:"));
+	assert(instructions.includes("Currently open on screen:"));
+	assert(instructions.includes("Recent conversation"));
+	assert(!instructions.includes("SECRET_EXPLANATION_DO_NOT_LEAK"));
+});
+
+test("extractLiveSessionContext falls back to plan-block markers and includes practice thinking without modelSolution", () => {
+	const messages: LhMessage[] = [
+		newPlanBlockMessage("plan_1", {
+			kind: "full",
+			at: "2026-11-26T00:00:00.000Z",
+			current: "n1",
+			nodes: [
+				{ id: "n1", title: "Kanji readings", status: "current" },
+				{ id: "n2", title: "Compounds", status: "upcoming" },
+			],
+			edges: [{ from: "n1", to: "n2" }],
+		}),
+		assistantMessage([
+			{
+				type: "toolCall",
+				id: "prob_1",
+				name: "problem",
+				arguments: {
+					statement: "Translate: I want to eat ramen.",
+					modelSolution: "SECRET_MODEL_SOLUTION",
+				},
+			},
+		], "toolUse"),
+		{
+			id: "tr_prob_1",
+			role: "toolResult",
+			toolCallId: "prob_1",
+			toolName: "problem",
+			content: [{ type: "text", text: "ok" }],
+			details: null,
+			isError: false,
+			timestamp: 2,
+		},
+		newThinkingMessage("prob_1", "ラーメンを食べたいです？"),
+	];
+
+	const snapshot = extractLiveSessionContext({ messages });
+	assert(snapshot.planSummary?.includes("- [current] Kanji readings"));
+	assert(snapshot.planSummary?.includes("- [upcoming] Compounds"));
+	assert(snapshot.planSummary?.includes("Kanji readings -> Compounds"));
+	assert(snapshot.recentTurns?.includes("Tutor: Practice problem: Translate: I want to eat ramen."));
+	assert(snapshot.recentTurns?.includes("Learner: [thinking] ラーメンを食べたいです？"));
+	assert(snapshot.activePrompt?.includes("Active practice problem: Translate: I want to eat ramen."));
+	assert(!snapshot.activePrompt?.includes("SECRET_MODEL_SOLUTION"));
+	assert(!snapshot.recentTurns?.includes("SECRET_MODEL_SOLUTION"));
+	const turnSummary = extractTurnSpokenSummary(messages);
+	assert(turnSummary.includes("Practice problem: Translate: I want to eat ramen."));
+	assert(!turnSummary.includes("SECRET_MODEL_SOLUTION"));
+});
+
+test("resolveSpokenInput submits multi-select quiz picks spoken together", () => {
+	const callId = "call_multi_1";
+	const rawOptions = [
+		{ label: "は", value: "wa" },
+		{ label: "が", value: "ga" },
+		{ label: "を", value: "wo" },
+	];
+	const messages: LhMessage[] = [
+		assistantMessage([
+			{
+				type: "toolCall",
+				id: callId,
+				name: "quiz",
+				arguments: {
+					type: "check",
+					nodeId: "particles",
+					question: "Which are subject or topic markers?",
+					multiSelect: true,
+					options: rawOptions,
+					correctAnswer: ["wa", "ga"],
+					explanation: "は marks the topic and が marks the subject.",
+				},
+			},
+		], "toolUse"),
+	];
+	const displayed = questionDisplayOptions(rawOptions, "quiz", true, callId);
+	const waIdx = displayed.options.findIndex((opt) => opt.value === "wa");
+	const gaIdx = displayed.options.findIndex((opt) => opt.value === "ga");
+	const res = resolveSpokenInput(messages, `${waIdx + 1} and ${gaIdx + 1}`);
+	assert.equal(res.kind, "answer");
+	assert.equal(res.answer.correct, true);
+	assert.deepEqual(res.answer.answers.map((a) => a.value).sort(), ["ga", "wa"]);
+
+	const jpRes = resolveSpokenInput(messages, "は、が");
+	assert.equal(jpRes.kind, "answer");
+	assert.equal(jpRes.answer.correct, true);
+
+	const unmatched = resolveSpokenInput(messages, "は and something else");
+	assert.equal(unmatched.kind, "quiz-unmatched");
+});
+
+test("createLiveSessionManager seeds Live transport instructions with plan and recent conversation", async () => {
+	let capturedInstructions = "";
+	const manager = createLiveSessionManager({
+		getChat: () => ({
+			id: "chat_ctx",
+			title: "Japanese Grammar",
+			kind: "teach",
+			tree: {
+				version: 1,
+				nodes: [{ id: "n1", title: "Te-form basics" }],
+				edges: [],
+			},
+			messages: [
+				{ id: "u1", role: "user", content: "Explain て-form please", timestamp: 1 },
+				assistantMessage([{ type: "text", text: "For ichidan verbs, drop る and add て." }]),
+			],
+		}),
+		runChatInput: async () => new Response("", { status: 200 }),
+		steerChat: async () => "stale",
+		isRunning: () => false,
+		getRunningTurn: () => undefined,
+		getEndpoint: () => undefined,
+		refreshCodex: async () => {},
+		isCodexConnected: () => true,
+		leaseCodexAuth: async () => ({ accessToken: "tok", accountId: "acct" }),
+		watchCodexAbort: () => ({ controller: new AbortController(), release: () => {} }),
+		createTransport: (options) => {
+			capturedInstructions = options.instructions;
+			return {
+				sdpAnswer: "v=0\r\n",
+				connect: async () => {},
+				send: async () => {},
+				close: async () => {},
+			};
+		},
+	});
+
+	await manager.start({ chatId: "chat_ctx", sdpOffer: "v=0\r\n" });
+	assert(capturedInstructions.includes("Lesson plan overview:"));
+	assert(capturedInstructions.includes("Te-form basics"));
+	assert(capturedInstructions.includes("Learner: Explain て-form please"));
+	assert(capturedInstructions.includes("Tutor: For ichidan verbs, drop る and add て."));
+	await manager.stop("chat_ctx");
 });
