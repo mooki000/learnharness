@@ -55,7 +55,9 @@ export function nativeSubscriptionStream(provider: Provider, background: () => b
 				const transport = { ...nativeModel, ...replay, ...(auth.baseUrl ? { baseUrl: auth.baseUrl } : {}) };
 				const fetch = options?.fetch ?? globalThis.fetch;
 				const source = provider.streamSimple(transport, subscriptionHistory(normalizeContext(context), logicalModel, nativeId), {
-					...options, apiKey: auth.apiKey, headers: { ...options?.headers, ...auth.headers }, signal, maxRetries: 0,
+					...options,
+					...(nativeModel.api === "openai-codex-responses" ? { transport: "sse" as const } : {}),
+					apiKey: auth.apiKey, headers: { ...options?.headers, ...auth.headers }, signal, maxRetries: 0,
 					fetch: (input, init) => {
 						check(); if (committed) throw new Error("Subscription requests do not retry after dispatch");
 						lifecycle?.beforeDispatch(subscriptionAdmissionScope(scope!)); committed = true; return fetch(input, init);

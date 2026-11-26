@@ -65,6 +65,8 @@ export type { ChatGPTStatus, ChatGPTControlBridge } from "./contracts/chatgpt.ts
 export { codexSpeedsFor, isCodexSpeed } from "./codex-speed.ts";
 export { NATIVE_SUBSCRIPTIONS } from "./contracts/subscriptions.ts";
 export type { NativeSubscriptionProviderId, NativeSubscriptionLogicalId, NativeSubscriptionStatus, NativeSubscriptionSnapshot, NativeSubscriptionScope, NativeSubscriptionControlBridge, SubscriptionInteraction, SubscriptionPrompt } from "./contracts/subscriptions.ts";
+export { LIVE_MODEL, LIVE_VOICES, DEFAULT_LIVE_VOICE, isLiveVoice } from "./contracts/live.ts";
+export type { LiveVoiceId, LivePhase, LiveTranscriptEntry, LiveAvailability, LiveClientEvent } from "./contracts/live.ts";
 export * from "./cost-summary.ts";
 export { CLAUDE_CODE_PROVIDER, CLAUDE_CODE_MINIMUM_VERSION, type ClaudeCodeStatus } from "./contracts/claude-code.ts";
 export * from "./fuzzy.ts";

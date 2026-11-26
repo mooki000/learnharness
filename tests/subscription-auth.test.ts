@@ -9,22 +9,24 @@ import { createModels, type OAuthCredential, type ProviderAuthInteraction } from
 import { githubCopilotProvider } from "@earendil-works/pi-ai/providers/github-copilot";
 import { xaiProvider } from "@earendil-works/pi-ai/providers/xai";
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
+import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import type { NativeSubscriptionScope } from "../src/core/contracts/subscriptions.ts";
 const require = createRequire(import.meta.url);
 const { createSubscriptions, loadSubscriptionSDK, validEndpoint, validBearer, publicError } = require("../electron/subscriptions.cjs");
 const { fileStore, validateState } = require("../electron/subscription-store.cjs");
 const { subscriptionControl } = require("../electron/subscription-ipc.cjs");
-const ids = ["github-copilot", "xai", "anthropic"] as const;
-const credential = (id: string, expires = Date.now() + 3600000): OAuthCredential => ({ type: "oauth", access: id === "xai" ? "fixture-xai-access" : id === "anthropic" ? "sk-ant-oat01-fixture-claude-access" : "tid=fixture;proxy-ep=proxy.individual.githubcopilot.com;", refresh: "fixture-refresh", expires, ...(id === "github-copilot" ? { availableModelIds: [githubCopilotProvider().getModels()[0]!.id] } : {}) });
+const CODEX_JWT = `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acct_fixture" } })).toString("base64url")}.sig`;
+const ids = ["github-copilot", "xai", "anthropic", "openai-codex"] as const;
+const credential = (id: string, expires = Date.now() + 3600000): OAuthCredential => ({ type: "oauth", access: id === "xai" ? "fixture-xai-access" : id === "anthropic" ? "sk-ant-oat01-fixture-claude-access" : id === "openai-codex" ? CODEX_JWT : "tid=fixture;proxy-ep=proxy.individual.githubcopilot.com;", refresh: "fixture-refresh", expires, ...(id === "github-copilot" ? { availableModelIds: [githubCopilotProvider().getModels()[0]!.id] } : id === "openai-codex" ? { accountId: "acct_fixture" } : {}) });
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((done) => { resolve = done; }); return { resolve, promise }; }
 async function fixture(options: { login?: (id: string, interaction: ProviderAuthInteraction) => Promise<OAuthCredential>; refresh?: (id: string, value: OAuthCredential, signal: AbortSignal) => Promise<OAuthCredential>; stores?: Record<string, unknown> } = {}) {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lh-subscription-auth-"));
 	let refreshes = 0;
 	const factory = (id: string) => {
-		const native = id === "xai" ? xaiProvider() : id === "anthropic" ? anthropicProvider() : githubCopilotProvider();
+		const native = id === "xai" ? xaiProvider() : id === "anthropic" ? anthropicProvider() : id === "openai-codex" ? openaiCodexProvider() : githubCopilotProvider();
 		return { ...native, auth: { ...native.auth, oauth: { ...native.auth.oauth!, login: (interaction: ProviderAuthInteraction) => options.login?.(id, interaction) ?? Promise.resolve(credential(id)), refresh: async (value: OAuthCredential, signal: AbortSignal) => { refreshes++; return options.refresh?.(id, value, signal) ?? { ...credential(id), refresh: "fixture-rotated" }; } } } };
 	};
-	const sdk = { createModels, githubCopilotProvider: () => factory("github-copilot"), xaiProvider: () => factory("xai"), anthropicProvider: () => factory("anthropic") };
+	const sdk = { createModels, githubCopilotProvider: () => factory("github-copilot"), xaiProvider: () => factory("xai"), anthropicProvider: () => factory("anthropic"), openaiCodexProvider: () => factory("openai-codex") };
 	const updates: any[] = [], opened: string[] = [];
 	const controller = createSubscriptions({ directory, sdk, stores: options.stores, openExternal: async (url: string) => { opened.push(url); }, onChange: (snapshot: unknown) => updates.push(snapshot) });
 	await controller.ready;
@@ -37,7 +39,7 @@ async function fixture(options: { login?: (id: string, interaction: ProviderAuth
 test("main loader resolves Pi's import-only PUBLIC package exports and native OAuth without a CLI or network", async () => {
 	const sdk = await loadSubscriptionSDK(path.resolve(import.meta.dirname, ".."));
 	assert.equal(typeof sdk.createModels, "function");
-	for (const [id, factory] of [["github-copilot", sdk.githubCopilotProvider], ["xai", sdk.xaiProvider], ["anthropic", sdk.anthropicProvider]] as const) {
+	for (const [id, factory] of [["github-copilot", sdk.githubCopilotProvider], ["xai", sdk.xaiProvider], ["anthropic", sdk.anthropicProvider], ["openai-codex", sdk.openaiCodexProvider]] as const) {
 		const provider = factory(), store = new sdk.InMemoryCredentialStore(); await store.modify(id, () => credential(id));
 		const models = sdk.createModels({ credentials: store }); models.setProvider({ ...provider, auth: { oauth: provider.auth.oauth } });
 		const resolved = await models.getAuth(provider.getModels()[0]); assert.equal(resolved.auth.apiKey, credential(id).access);
@@ -278,4 +280,14 @@ test("atomic store failed rename preserves original and leaves no temporary file
 		assert.deepEqual(JSON.parse(await fs.readFile(file, "utf8")), state);
 		assert.deepEqual((await fs.readdir(f.directory)).filter((name) => name.endsWith(".tmp")), []);
 	} finally { await f.cleanup(); }
+});
+test("OpenAI Codex subscription requires a Codex JWT bearer and pins the ChatGPT backend endpoint", async () => {
+	const value = credential("openai-codex");
+	assert(validEndpoint("openai-codex", { apiKey: value.access }, value));
+	assert(validEndpoint("openai-codex", { apiKey: value.access, baseUrl: "https://chatgpt.com/backend-api" }, value));
+	for (const baseUrl of ["http://chatgpt.com/backend-api", "https://api.openai.com/v1", "https://attacker.example/backend-api", "https://chatgpt.com/backend-api?x=1"]) {
+		assert(!validEndpoint("openai-codex", { apiKey: value.access, baseUrl }, value));
+	}
+	assert(validBearer("openai-codex", { apiKey: value.access }));
+	for (const auth of [{ apiKey: "sk-proj-api-key" }, { apiKey: "not-a-jwt" }, {}]) assert(!validBearer("openai-codex", auth));
 });

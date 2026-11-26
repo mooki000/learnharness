@@ -22,7 +22,7 @@ function safeTree(root) {
 	directory(root);
 	function visit(current) {
 		for (const name of fs.readdirSync(current)) {
-			if (/^(data|core-plugin-data|node_modules|src|tests|\.sdk|\.git)$/.test(name) || /^(\.env($|\.)|auth\.json($|\.)|(chatgpt|github-copilot|xai|anthropic)-credentials\.json)/.test(name) || /\.(ts|tsx)$/.test(name) || /^(package|package-lock)\.json$/.test(name)) throw new Error(`Refusing unsafe Core package content: ${path.join(current, name)}`);
+			if (/^(data|core-plugin-data|node_modules|src|tests|\.sdk|\.git)$/.test(name) || /^(\.env($|\.)|auth\.json($|\.)|(chatgpt|github-copilot|xai|anthropic|openai-codex)-credentials\.json)/.test(name) || /\.(ts|tsx)$/.test(name) || /^(package|package-lock)\.json$/.test(name)) throw new Error(`Refusing unsafe Core package content: ${path.join(current, name)}`);
 			const filename = path.join(current, name), stat = fs.lstatSync(filename);
 			if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) throw new Error(`Unsafe Core package file: ${filename}`);
 			if (stat.isDirectory()) visit(filename);

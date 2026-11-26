@@ -45,6 +45,7 @@ import { useAppearance } from "@/components/settings/appearance";
 import { dockContainerMax, layoutFontKey, questionCardGeometry, rootRem, type QuestionLayout } from "@/components/question-layout";
 import { QueuedSteersBody, type QueuedSteerLine } from "@/components/queued-steers";
 import { DictationBar, finishDictation, joinDictation, useDictation, type Dictation } from "@/components/dictation";
+import { LiveCaptionStrip, LiveVoiceBar, useLiveVoice } from "@/components/live-voice";
 import { useFieldCycle } from "@/components/field-cycle";
 import { useOptionalInteractionLayers } from "./interaction-layers";
 import { isInteractionScopeEligible } from "./plugin-input-focus";
@@ -963,6 +964,7 @@ export function Chat({
 		error: recording.destinationId === "main" ? recording.error : null,
 		blocked: recording.destinationId !== "main" && recording.active,
 	};
+	const liveVoice = useLiveVoice({ chatId, onBeforeStart: dictation.cancel });
 	/* When a dictation run ends, the bare composer takes focus (owner
 	 * 2026-10-01) — the hands are already on the keyboard from the stop.
 	 * Falling edge of `active` only (idle→idle never focuses), and ONLY the
@@ -2098,7 +2100,21 @@ export function Chat({
 					cliContextWindow={cliContextWindowOf(nativeMessages)}
 					pricing={pricing}
 					onReserve={setDockReserve}
-					dictationSlot={<DictationBar dictation={dictation} disabled={pluginOwnsDock && !pluginMicAvailable} />}
+					liveBanner={liveVoice.active ? <LiveCaptionStrip live={liveVoice} /> : undefined}
+					dictationSlot={
+						liveVoice.active ? (
+							<LiveVoiceBar live={liveVoice} />
+						) : dictation.active ? (
+							<DictationBar dictation={dictation} disabled={pluginOwnsDock && !pluginMicAvailable} />
+						) : (
+							<div className="flex w-full min-w-0 items-center gap-1.5">
+								<div className="min-w-0 flex-1">
+									<DictationBar dictation={dictation} disabled={pluginOwnsDock && !pluginMicAvailable} />
+								</div>
+								<LiveVoiceBar live={liveVoice} />
+							</div>
+						)
+					}
 					dictationCancel={dictation.cancel}
 					queuedSteers={visibleQueuedSteers(steerQueue, nativeMessages)}
 					setupCta={
@@ -2418,6 +2434,7 @@ export function DockOverlay({
 	plan,
 	onOpenPlan,
 	dictationSlot,
+	liveBanner,
 	dictationCancel,
 	setupCta,
 	queuedSteers,
@@ -2487,6 +2504,8 @@ export function DockOverlay({
 	/** The dictation strip (STT wave): rendered in the stats bar's middle
 	 *  slot — the mic button + live meter (components/dictation.tsx). */
 	dictationSlot?: React.ReactNode;
+	/** Optional live-voice caption strip rendered above the composer shell. */
+	liveBanner?: React.ReactNode;
 	/** Esc in a pending question's field stops dictation (the strip is the
 	 *  stats bar's; the stop belongs to the page-owned hook, threaded down). */
 	dictationCancel?: () => void;
@@ -2943,6 +2962,7 @@ export function DockOverlay({
 							claim={revealPending}
 						/>
 					)}
+					{liveBanner}
 					<div ref={shellRef} data-attachment-composer="" className="pointer-events-auto overflow-hidden rounded-2xl border bg-card shadow-lg">
 						{preparationStatus}
 						{/* Include descendant margins (notably practice thinking's

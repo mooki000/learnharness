@@ -5,10 +5,10 @@ const { createRequire, registerHooks } = require("node:module");
 const { pathToFileURL } = require("node:url");
 const { PROVIDERS, fileStore, validateCredential, safeHttps, failure } = require("./subscription-store.cjs");
 
-const LABELS = { "github-copilot": "GitHub Copilot", xai: "Grok", anthropic: "Claude" };
-const DEFAULT_BASE = { "github-copilot": "https://api.individual.githubcopilot.com", xai: "https://api.x.ai/v1", anthropic: "https://api.anthropic.com" };
-const FACTORIES = { "github-copilot": (sdk) => sdk.githubCopilotProvider(), xai: (sdk) => sdk.xaiProvider(), anthropic: (sdk) => sdk.anthropicProvider() };
-const APIS = new Set(["openai-responses", "openai-completions", "anthropic-messages"]);
+const LABELS = { "github-copilot": "GitHub Copilot", xai: "Grok", anthropic: "Claude", "openai-codex": "OpenAI Codex" };
+const DEFAULT_BASE = { "github-copilot": "https://api.individual.githubcopilot.com", xai: "https://api.x.ai/v1", anthropic: "https://api.anthropic.com", "openai-codex": "https://chatgpt.com/backend-api" };
+const FACTORIES = { "github-copilot": (sdk) => sdk.githubCopilotProvider(), xai: (sdk) => sdk.xaiProvider(), anthropic: (sdk) => sdk.anthropicProvider(), "openai-codex": (sdk) => sdk.openaiCodexProvider() };
+const APIS = new Set(["openai-responses", "openai-completions", "anthropic-messages", "openai-codex-responses"]);
 const clone = (value) => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 const MESSAGES = {
 	storage: "The saved connection could not be read or written safely. Reopen the app or reconnect after resolving the credential-file problem.",
@@ -35,8 +35,8 @@ async function loadSubscriptionSDK(baseDirectory) {
 		try { file = resolve.resolve(id); } finally { hook.deregister(); }
 		return import(pathToFileURL(file).href);
 	};
-	const [sdk, copilot, xai, anthropic] = await Promise.all([load("@earendil-works/pi-ai"), load("@earendil-works/pi-ai/providers/github-copilot"), load("@earendil-works/pi-ai/providers/xai"), load("@earendil-works/pi-ai/providers/anthropic")]);
-	return { ...sdk, ...copilot, ...xai, ...anthropic };
+	const [sdk, copilot, xai, anthropic, codex] = await Promise.all([load("@earendil-works/pi-ai"), load("@earendil-works/pi-ai/providers/github-copilot"), load("@earendil-works/pi-ai/providers/xai"), load("@earendil-works/pi-ai/providers/anthropic"), load("@earendil-works/pi-ai/providers/openai-codex")]);
+	return { ...sdk, ...copilot, ...xai, ...anthropic, ...codex };
 }
 function validEndpoint(providerId, auth, credential) {
 	if (!auth || (!(typeof auth.apiKey === "string" && auth.apiKey.length > 0) && !Object.entries(auth.headers ?? {}).some(([key, value]) => ["authorization", "x-api-key", "api-key"].includes(key.toLowerCase()) && typeof value === "string" && value.trim().length > 0))) return false;
@@ -46,12 +46,26 @@ function validEndpoint(providerId, auth, credential) {
 	const url = new URL(value);
 	if (providerId === "xai") return url.origin === "https://api.x.ai" && url.pathname.replace(/\/$/, "") === "/v1" && !url.search && !url.hash;
 	if (providerId === "anthropic") return url.origin === "https://api.anthropic.com" && url.pathname === "/" && !url.search && !url.hash;
+	if (providerId === "openai-codex") return url.origin === "https://chatgpt.com" && url.pathname.replace(/\/$/, "") === "/backend-api" && !url.search && !url.hash;
 	const domain = credential?.enterpriseUrl;
 	return !url.search && !url.hash && url.pathname === "/" && (!url.port || url.port === "443") && (url.hostname.endsWith(".githubcopilot.com") || (domain && (url.hostname === domain || url.hostname.endsWith(`.${domain}`))));
 }
-/** Claude's subscription must stay an OAuth bearer: Pi treats any other string as an ordinary API key (x-api-key), which would silently bill the API. Checked at login and lease time only. */
-function validBearer(providerId, auth) { return providerId !== "anthropic" || (typeof auth?.apiKey === "string" && auth.apiKey.includes("sk-ant-oat")); }
-/** Main owns durable credentials and refresh. Everything returned by status/snapshot is explicitly projected. */
+function codexAccountId(token) {
+	if (typeof token !== "string") return null;
+	const parts = token.split(".");
+	if (parts.length !== 3) return null;
+	try {
+		const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+		const id = payload?.["https://api.openai.com/auth"]?.chatgpt_account_id;
+		return typeof id === "string" && id.length > 0 ? id : null;
+	} catch { return null; }
+}
+/** Subscription tokens must never silently degrade into API-key auth. Checked at login and lease time only. */
+function validBearer(providerId, auth) {
+	if (providerId === "anthropic") return typeof auth?.apiKey === "string" && auth.apiKey.includes("sk-ant-oat");
+	if (providerId === "openai-codex") return codexAccountId(auth?.apiKey) !== null;
+	return true;
+}
 function createSubscriptions(options) {
 	let sdk;
 	let closed = false, paused = false;

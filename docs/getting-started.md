@@ -7,7 +7,7 @@ Download LearnHarness from [learnharness.ai](https://learnharness.ai) or [GitHub
 Open **Settings → Providers** and configure a connection:
 
 - **Provider API keys:** use your own account and pay that provider's rates.
-- **Subscription connections:** ChatGPT, GitHub Copilot, Grok, and Claude use their respective sign-in flows and account limits. They do not silently fall back to API-key billing.
+- **Subscription connections:** ChatGPT, GitHub Copilot, Grok, Claude, and OpenAI Codex use their respective sign-in flows and account limits. They do not silently fall back to API-key billing.
 - **[Claude Code](claude-code.md):** use a separately installed and authenticated CLI. Its own configuration controls routing and billing; this is not a subscription-only guarantee.
 - **[Custom endpoint](custom-providers.md):** connect one OpenAI-compatible server, including a local model server. LearnHarness does not install or download models.
 
@@ -36,6 +36,12 @@ Sessions are saved locally, including earlier messages when context is compacted
 3. Use the microphone or **Mod+D** to start and stop. Review the text before sending. **Esc cancellation discards the pending transcript**; stop normally to keep it.
 
 Audio streams from your browser directly to Deepgram using a short-lived token. A `403 Insufficient permissions` error while obtaining that token can mean the key's role is insufficient.
+
+## Live voice (`gpt-live-1-codex`)
+
+Connect **OpenAI Codex** under **Settings → Providers → Subscriptions** (browser login or headless device code), then click **Live** in any session's bottom bar (and optionally choose a voice from the adjacent dropdown).
+
+Audio runs full-duplex over WebRTC between your browser/desktop window and OpenAI's realtime voice session (`gpt-live-1-codex`), while the LearnHarness server keeps your Codex OAuth token server-side and bridges delegations directly to the session's tutor agent—so spoken replies, free-recall answers, and multiple-choice selections stay synchronized with the transcript and question cards, and the tutor's responses are read aloud.
 
 ## Use local files in a session
 
