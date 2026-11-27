@@ -3,6 +3,7 @@ import {
 	DEFAULT_LIVE_VOICE,
 	LIVE_VOICES,
 	isLiveVoice,
+	sanitizeLiveTranscript,
 	upsertLiveTranscript,
 	type LiveAvailability,
 	type LiveClientEvent,
@@ -33,6 +34,8 @@ import { isTurnRunning } from "../turn-liveness.ts";
 import { runningTurn } from "../turn-runs.ts";
 import {
 	buildDelegationContextAppend,
+	buildInputAudioPause,
+	buildInputAudioResume,
 	buildSessionContextAppend,
 	buildTutorLiveInstructions,
 	buildTutorLiveSessionSeed,
@@ -73,7 +76,15 @@ export class LiveSessionError extends Error {
 }
 
 export interface LiveSessionDeps {
-	getChat: (chatId: string) => { id: string; title?: string; kind?: string; tree?: PlanTree; messages: LhMessage[] } | null;
+	getChat: (chatId: string) => {
+		id: string;
+		title?: string;
+		kind?: string;
+		tree?: PlanTree;
+		messages: LhMessage[];
+		liveTranscript?: LiveTranscriptEntry[];
+	} | null;
+	saveLiveTranscript?: (chatId: string, entries: LiveTranscriptEntry[]) => void;
 	runChatInput: (chatId: string, input: ChatInput) => Promise<Response>;
 	askSideQuestion?: (chatId: string, text: string, anchorMessageId: string) => Promise<Response>;
 	getLivePrompt?: () => string | undefined;
@@ -93,6 +104,9 @@ export interface LiveSessionManager {
 	availability(): Promise<LiveAvailability>;
 	start(params: { chatId: string; sdpOffer: string; voice?: string }): Promise<{ liveId: string; sdpAnswer: string; voice: LiveVoiceId }>;
 	subscribe(chatId: string, liveId: string): ReadableStream<Uint8Array> | null;
+	setPaused(chatId: string, liveId: string | undefined, paused: boolean): Promise<boolean>;
+	getTranscript(chatId: string): LiveTranscriptEntry[] | null;
+	clearTranscript(chatId: string): boolean;
 	stop(chatId: string, liveId?: string): Promise<boolean>;
 	activeLiveId(chatId: string): string | undefined;
 }
@@ -102,6 +116,7 @@ interface ManagedLiveSession {
 	chatId: string;
 	voice: LiveVoiceId;
 	phase: LivePhase;
+	paused: boolean;
 	ended: boolean;
 	endError?: string;
 	activeDelegationId?: string;
@@ -118,6 +133,7 @@ interface ManagedLiveSession {
 	contextSeeded: boolean;
 	lastTranscript?: LiveTranscriptEntry;
 	transcriptHistory: LiveTranscriptEntry[];
+	transcriptDirty: boolean;
 	subscribers: Set<(event: LiveClientEvent) => void>;
 	detachTimer?: ReturnType<typeof setTimeout>;
 	releaseAbort?: () => void;
@@ -227,7 +243,7 @@ function truncateUtf8Bytes(text: string, maxBytes: number): string {
 }
 
 function buildPendingFallbackPayload(
-	record: { messages: readonly LhMessage[]; tree?: PlanTree },
+	record: { messages: readonly LhMessage[]; tree?: PlanTree; liveTranscript?: readonly LiveTranscriptEntry[] },
 	baseHint: string,
 	sideError?: string,
 ): { commentary?: string; finalMessage: string } {
@@ -235,6 +251,7 @@ function buildPendingFallbackPayload(
 	const commentaryParts: string[] = [];
 	if (ctx.planSummary) commentaryParts.push(`Lesson plan overview:\n${ctx.planSummary}`);
 	if (ctx.recentTurns) commentaryParts.push(`Recent conversation:\n${ctx.recentTurns}`);
+	if (ctx.priorVoiceTurns) commentaryParts.push(`Prior Live Voice conversation:\n${ctx.priorVoiceTurns}`);
 	commentaryParts.push(baseHint);
 
 	const shortError = sideError?.trim()
@@ -295,6 +312,16 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 		emitEvent(session, { type: "phase", phase });
 	}
 
+	function persistTranscript(session: ManagedLiveSession, markFinal: boolean = false) {
+		if (!deps.saveLiveTranscript) return;
+		const snapshot = sanitizeLiveTranscript(session.transcriptHistory, { markFinal });
+		if (markFinal) {
+			session.transcriptHistory = snapshot;
+		}
+		deps.saveLiveTranscript(session.chatId, snapshot);
+		session.transcriptDirty = false;
+	}
+
 	function emitTranscript(session: ManagedLiveSession, role: "user" | "assistant", text: string, final: boolean) {
 		const trimmed = text.trim();
 		if (!trimmed) return;
@@ -311,9 +338,12 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 		const entry: LiveTranscriptEntry = { role, turn, text: trimmed, final };
 		session.lastTranscript = entry;
 		session.transcriptHistory = upsertLiveTranscript(session.transcriptHistory, entry);
+		session.transcriptDirty = true;
+		if (final) {
+			persistTranscript(session, false);
+		}
 		emitEvent(session, { type: "transcript", entry });
 	}
-
 	function applyTranscriptDelta(session: ManagedLiveSession, role: "user" | "assistant", delta: string) {
 		if (!delta) return;
 		const current = role === "user" ? session.userText : session.assistantText;
@@ -442,8 +472,12 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 					return;
 				}
 				logLiveDiagnostic(`[live] delegation (${session.chatId}): route=plugin-fallback`);
+				const fallbackRecord = {
+					...recordBefore,
+					liveTranscript: session.transcriptHistory.length > 0 ? session.transcriptHistory : recordBefore.liveTranscript,
+				};
 				const fallback = buildPendingFallbackPayload(
-					recordBefore,
+					fallbackRecord,
 					"There is an interactive question card waiting on screen. Answer any clarifying or lesson-plan question using the session context without revealing answers, and remind the learner to complete or dismiss the card on screen.",
 					sideResult.error,
 				);
@@ -463,14 +497,17 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 					return;
 				}
 				logLiveDiagnostic(`[live] delegation (${session.chatId}): route=quiz-fallback`);
-				const fallback = buildPendingFallbackPayload(recordBefore, resolution.promptHint, sideResult.error);
+				const fallbackRecord = {
+					...recordBefore,
+					liveTranscript: session.transcriptHistory.length > 0 ? session.transcriptHistory : recordBefore.liveTranscript,
+				};
+				const fallback = buildPendingFallbackPayload(fallbackRecord, resolution.promptHint, sideResult.error);
 				if (fallback.commentary) {
 					await sendDelegationText(session, delegationItemId, fallback.commentary, "commentary");
 				}
 				await sendDelegationText(session, delegationItemId, formatAgentFinalMessage(fallback.finalMessage));
 				return;
 			}
-
 			const input: ChatInput = resolution.kind === "answer"
 				? { type: "answer", toolCallId: resolution.toolCallId, answer: resolution.answer }
 				: { type: "text", text };
@@ -496,7 +533,7 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 		} finally {
 			if (session.activeDelegationId === delegationItemId) {
 				session.activeDelegationId = undefined;
-				if (!session.ended) setPhase(session, "listening");
+				if (!session.ended) setPhase(session, session.paused ? "paused" : "listening");
 			}
 		}
 	}
@@ -548,8 +585,18 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 		if (previous) await previous.stop();
 
 		const freshRecord = deps.getChat(params.chatId) ?? record;
+		const priorTranscript = sanitizeLiveTranscript(freshRecord.liveTranscript, { markFinal: true });
+		let maxUserTurn = 0;
+		let maxAssistantTurn = 0;
+		for (const entry of priorTranscript) {
+			if (entry.role === "user" && entry.turn > maxUserTurn) maxUserTurn = entry.turn;
+			if (entry.role === "assistant" && entry.turn > maxAssistantTurn) maxAssistantTurn = entry.turn;
+		}
 		const liveId = randomUUID();
-		const sessionContext = extractLiveSessionContext(freshRecord);
+		const sessionContext = extractLiveSessionContext({
+			...freshRecord,
+			liveTranscript: priorTranscript,
+		});
 		const customInstructions = deps.getLivePrompt?.()?.trim() || undefined;
 		const instructions = buildTutorLiveInstructions({
 			sessionTitle: freshRecord.title,
@@ -575,19 +622,22 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 			chatId: params.chatId,
 			voice,
 			phase: "connecting",
+			paused: false,
 			ended: false,
 			delegationQueue: Promise.resolve(),
 			userText: "",
 			userFinal: false,
-			userTurn: 0,
+			userTurn: maxUserTurn,
 			assistantText: "",
 			assistantFinal: false,
-			assistantTurn: 0,
+			assistantTurn: maxAssistantTurn,
 			turnRoles: new Map(),
 			started: false,
 			connected: false,
 			contextSeeded: false,
-			transcriptHistory: [],
+			lastTranscript: priorTranscript.at(-1),
+			transcriptHistory: priorTranscript,
+			transcriptDirty: false,
 			subscribers: new Set(),
 			releaseAbort: () => {
 				codexWatcher?.controller.signal.removeEventListener("abort", onCodexAbort);
@@ -600,6 +650,9 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 				if (session.detachTimer) { clearTimeout(session.detachTimer); session.detachTimer = undefined; }
 				sessionAbort.abort();
 				session.releaseAbort?.();
+				if (session.transcriptDirty || session.transcriptHistory.some((entry) => !entry.final)) {
+					persistTranscript(session, true);
+				}
 				if (sessions.get(params.chatId) === session) {
 					sessions.delete(params.chatId);
 				}
@@ -625,13 +678,23 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 				case "session.started":
 					session.started = true;
 					logLiveDiagnostic(
-						`[live] started (${params.chatId}, remote=${event.session.id}, seedChars=${sessionSeed?.length ?? 0}, seedEstTok=${sessionSeed ? estimateLiveContextTokens(sessionSeed) : 0}, customInstr=${customInstructions?.length ?? 0}, plan=${sessionContext.planSummary?.length ?? 0}, recent=${sessionContext.recentTurns?.length ?? 0}, active=${sessionContext.activePrompt?.length ?? 0})`,
+						`[live] started (${params.chatId}, remote=${event.session.id}, seedChars=${sessionSeed?.length ?? 0}, seedEstTok=${sessionSeed ? estimateLiveContextTokens(sessionSeed) : 0}, customInstr=${customInstructions?.length ?? 0}, plan=${sessionContext.planSummary?.length ?? 0}, recent=${sessionContext.recentTurns?.length ?? 0}, priorVoice=${sessionContext.priorVoiceTurns?.length ?? 0}, active=${sessionContext.activePrompt?.length ?? 0})`,
 					);
 					maybeSeedSessionContext();
-					if (!session.activeDelegationId) setPhase(session, "listening");
+					if (!session.activeDelegationId) setPhase(session, session.paused ? "paused" : "listening");
 					break;
 				case "session.context.appended":
 					logLiveDiagnostic(`[live] context-seeded (${params.chatId})`);
+					break;
+				case "input_audio.paused":
+					session.paused = true;
+					logLiveDiagnostic(`[live] input-paused (${params.chatId})`);
+					setPhase(session, "paused");
+					break;
+				case "input_audio.resumed":
+					session.paused = false;
+					logLiveDiagnostic(`[live] input-resumed (${params.chatId})`);
+					setPhase(session, session.activeDelegationId ? "working" : "listening");
 					break;
 				case "input_transcript.added":
 					applyTranscriptDelta(session, "user", event.item.text);
@@ -711,7 +774,7 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 		}, Math.max(detachGraceMs, 10_000));
 		session.detachTimer.unref?.();
 
-		if (session.phase === "connecting") setPhase(session, "listening");
+		if (session.phase === "connecting") setPhase(session, session.paused ? "paused" : "listening");
 		return { liveId, sdpAnswer, voice };
 	}
 
@@ -768,6 +831,47 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 		});
 	}
 
+	async function setPaused(chatId: string, liveId: string | undefined, paused: boolean): Promise<boolean> {
+		const session = sessions.get(chatId);
+		if (!session || session.ended || !session.transport) return false;
+		if (liveId && session.liveId !== liveId) return false;
+		try {
+			await session.transport.send(paused ? buildInputAudioPause() : buildInputAudioResume());
+		} catch {
+			return false;
+		}
+		session.paused = paused;
+		setPhase(session, paused ? "paused" : (session.activeDelegationId ? "working" : "listening"));
+		return true;
+	}
+
+	function getTranscript(chatId: string): LiveTranscriptEntry[] | null {
+		const active = sessions.get(chatId);
+		if (active) return [...active.transcriptHistory];
+		const record = deps.getChat(chatId);
+		if (!record) return null;
+		return sanitizeLiveTranscript(record.liveTranscript, { markFinal: true });
+	}
+
+	function clearTranscript(chatId: string): boolean {
+		const active = sessions.get(chatId);
+		if (active) {
+			active.transcriptHistory = [];
+			active.lastTranscript = undefined;
+			active.userText = "";
+			active.userFinal = false;
+			active.userTurn = 0;
+			active.assistantText = "";
+			active.assistantFinal = false;
+			active.assistantTurn = 0;
+			active.transcriptDirty = false;
+		}
+		const exists = active !== undefined || deps.getChat(chatId) !== null;
+		if (!exists) return false;
+		deps.saveLiveTranscript?.(chatId, []);
+		return true;
+	}
+
 	async function stop(chatId: string, liveId?: string): Promise<boolean> {
 		const session = sessions.get(chatId);
 		if (!session) return false;
@@ -780,7 +884,7 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 		return sessions.get(chatId)?.liveId;
 	}
 
-	return { availability, start, subscribe, stop, activeLiveId };
+	return { availability, start, subscribe, setPaused, getTranscript, clearTranscript, stop, activeLiveId };
 }
 
 const REGISTRY_KEY = Symbol.for("lh.live.sessionManager");
@@ -788,6 +892,9 @@ const REGISTRY_KEY = Symbol.for("lh.live.sessionManager");
 function defaultDeps(): LiveSessionDeps {
 	return {
 		getChat: (chatId) => stores.chatStore.getChat(chatId),
+		saveLiveTranscript: (chatId, entries) => {
+			stores.chatStore.updateLiveTranscript(chatId, () => entries);
+		},
 		runChatInput: (chatId, input) => handleChatInput(chatId, input),
 		askSideQuestion: (chatId, text, anchorMessageId) => {
 			const livePrompt = effectiveSettings().agent.livePrompt?.trim();
@@ -864,7 +971,13 @@ export async function handleLiveStartRequest(chatId: string, request: Request): 
 
 export function handleLiveEventsRequest(chatId: string, request: Request): Response {
 	const liveId = new URL(request.url).searchParams.get("liveId")?.trim() ?? "";
-	if (!liveId) return Response.json({ error: "liveId is required" }, { status: 400 });
+	if (!liveId) {
+		const manager = liveSessionManager();
+		const transcript = manager.getTranscript(chatId);
+		if (transcript === null) return Response.json({ error: "Unknown chat" }, { status: 404 });
+		const activeId = manager.activeLiveId(chatId);
+		return Response.json({ transcript, ...(activeId ? { activeLiveId: activeId } : {}) });
+	}
 	const stream = liveSessionManager().subscribe(chatId, liveId);
 	if (!stream) return Response.json({ error: "Live session not found" }, { status: 404 });
 	return new Response(stream, {
@@ -876,8 +989,32 @@ export function handleLiveEventsRequest(chatId: string, request: Request): Respo
 	});
 }
 
+export async function handleLivePauseRequest(chatId: string, request: Request): Promise<Response> {
+	let body: { liveId?: unknown; paused?: unknown };
+	try {
+		body = (await request.json()) as { liveId?: unknown; paused?: unknown };
+	} catch {
+		return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+	}
+	if (typeof body.paused !== "boolean") {
+		return Response.json({ error: "paused boolean is required" }, { status: 400 });
+	}
+	const liveId = typeof body.liveId === "string" && body.liveId.trim() ? body.liveId.trim() : undefined;
+	const ok = await liveSessionManager().setPaused(chatId, liveId, body.paused);
+	if (!ok) return Response.json({ error: "Live session not found" }, { status: 404 });
+	return Response.json({ ok: true, paused: body.paused });
+}
+
 export async function handleLiveStopRequest(chatId: string, request: Request): Promise<Response> {
-	const liveId = new URL(request.url).searchParams.get("liveId")?.trim() || undefined;
-	await liveSessionManager().stop(chatId, liveId);
+	const params = new URL(request.url).searchParams;
+	const liveId = params.get("liveId")?.trim() || undefined;
+	const clear = params.get("clearTranscript") === "1" || params.get("clearTranscript") === "true";
+	const manager = liveSessionManager();
+	if (liveId || !clear) {
+		await manager.stop(chatId, liveId);
+	}
+	if (clear) {
+		manager.clearTranscript(chatId);
+	}
 	return Response.json({ ok: true });
 }

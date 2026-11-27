@@ -15,6 +15,7 @@ import { emit } from "../core/events.ts";
 import type { ChatStore } from "../core/ports.ts";
 import type { ChatRecord, ChatSettings, ChatSummary, ExtractionRunUsage, ImageSnapshot, PlanTree, SideChatThread, TurnUsage } from "../core/contracts.ts";
 import { CURRENT_CHAT_VERSION } from "../core/contracts.ts";
+import { MAX_LIVE_TRANSCRIPT_ENTRIES, type LiveTranscriptEntry } from "../core/contracts/live.ts";
 import type { LhMessage } from "../core/native-messages.ts";
 import { activeProblemOf, danglingQuestionOf } from "../core/native-messages.ts";
 import { phaseAt3Lh } from "../core/phases.ts";
@@ -86,7 +87,7 @@ function listChats(): ChatSummary[] {
 			.filter((f) => f.endsWith(".json"))
 			.map((f) => getChat(f.slice(0, -5)))
 			.filter((r): r is ChatRecord => r !== null)
-			.map(({ messages, tree, turns, extractions, imageSnapshots: _imageSnapshots, sideChats: _sideChats, ...summary }) => {
+			.map(({ messages, tree, turns, extractions, imageSnapshots: _imageSnapshots, sideChats: _sideChats, liveTranscript: _liveTranscript, ...summary }) => {
 				// Per-record isolation (Wave B): a record whose messages fail the
 				// projection (e.g. pre-Wave-B UIMessage-format scratch — the
 				// zero-back-compat wipe makes these "corrupt") must not blank the
@@ -243,6 +244,25 @@ function updateSideChats(id: string, update: (threads: SideChatThread[]) => Side
 	return next;
 }
 
+/** Live Voice transcript (2026-11): atomic read-modify-write so spoken turns
+ *  persist across voice reconnects without clobbering concurrent message saves.
+ *  Null when the chat is gone. Silent; does not bump updatedAt. */
+function updateLiveTranscript(
+	id: string,
+	update: (entries: LiveTranscriptEntry[]) => LiveTranscriptEntry[],
+): LiveTranscriptEntry[] | null {
+	const record = getChat(id);
+	if (!record) return null;
+	const next = update(record.liveTranscript ?? []);
+	const capped = next.length > MAX_LIVE_TRANSCRIPT_ENTRIES
+		? next.slice(next.length - MAX_LIVE_TRANSCRIPT_ENTRIES)
+		: next;
+	if (capped.length > 0) record.liveTranscript = capped;
+	else delete record.liveTranscript;
+	writeChat(record);
+	return capped;
+}
+
 export const chatStore: ChatStore = {
 	createChat,
 	getChat,
@@ -256,4 +276,5 @@ export const chatStore: ChatStore = {
 	appendTurnUsage,
 	appendExtractionUsage,
 	updateSideChats,
+	updateLiveTranscript,
 };

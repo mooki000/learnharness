@@ -4,6 +4,7 @@ import {
 	derivePlanStatusesLh,
 	type PlanTree,
 } from "../../core/contracts/plan.ts";
+import type { LiveTranscriptEntry } from "../../core/contracts/live.ts";
 import type { LhMessage } from "../../core/native-messages.ts";
 import {
 	PRACTICE_PROBLEM_TOOL,
@@ -602,8 +603,26 @@ export interface LiveSessionContextSnapshot {
 	planTitles?: string;
 	compactMemory?: string;
 	recentTurns?: string;
+	priorVoiceTurns?: string;
 	activePrompt?: string;
 	hasPendingQuestion: boolean;
+}
+
+const MAX_PRIOR_VOICE_ENTRIES = 16;
+const MAX_PRIOR_VOICE_ENTRY_CHARS = 220;
+
+/** Format persisted Live Voice transcript entries concisely so a restarted
+ *  session picks up directly from what was already discussed aloud. */
+export function extractPriorVoiceTurns(entries: readonly LiveTranscriptEntry[] | undefined): string | undefined {
+	if (!entries || entries.length === 0) return undefined;
+	const cleaned = entries
+		.map((entry) => ({ role: entry.role, text: collapseInline(entry.text) }))
+		.filter((entry) => entry.text.length > 0);
+	if (cleaned.length === 0) return undefined;
+	return cleaned
+		.slice(-MAX_PRIOR_VOICE_ENTRIES)
+		.map((entry) => `${entry.role === "user" ? "Learner" : "Tutor"}: ${truncateCodepoints(entry.text, MAX_PRIOR_VOICE_ENTRY_CHARS)}`)
+		.join("\n");
 }
 
 function extractPlanTitles(tree: PlanTree | undefined, messages: readonly LhMessage[]): string | undefined {
@@ -624,21 +643,24 @@ function extractPlanTitles(tree: PlanTree | undefined, messages: readonly LhMess
 	return titles.slice(0, MAX_PLAN_NODES).map((title, i) => `${i + 1}. ${title}`).join("; ");
 }
 
-/** Build a compact, spoiler-free snapshot of the session plan, recent turns, and active prompt for Live connect. */
+/** Build a compact, spoiler-free snapshot of the session plan, recent turns, prior voice chat, and active prompt for Live connect. */
 export function extractLiveSessionContext(record: {
 	messages: readonly LhMessage[];
 	tree?: PlanTree;
+	liveTranscript?: readonly LiveTranscriptEntry[];
 }): LiveSessionContextSnapshot {
 	const planSummary = extractPlanSummary(record.tree, record.messages);
 	const planTitles = extractPlanTitles(record.tree, record.messages);
 	const compactMemory = buildCompactLiveMemorySummary(record) || undefined;
 	const recentTurns = extractRecentTurns(record.messages);
+	const priorVoiceTurns = extractPriorVoiceTurns(record.liveTranscript);
 	const { activePrompt, hasPendingQuestion } = extractActivePrompt(record.messages);
 	return {
 		...(planSummary ? { planSummary } : {}),
 		...(planTitles ? { planTitles } : {}),
 		...(compactMemory ? { compactMemory } : {}),
 		...(recentTurns ? { recentTurns } : {}),
+		...(priorVoiceTurns ? { priorVoiceTurns } : {}),
 		...(activePrompt ? { activePrompt } : {}),
 		hasPendingQuestion,
 	};

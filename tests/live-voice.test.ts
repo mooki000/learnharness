@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { newAnswerResult, newPlanBlockMessage, newThinkingMessage, type LhMessage } from "../src/core/native-messages.ts";
 import type { PlanTree } from "../src/core/contracts/plan.ts";
-import { upsertLiveTranscript, type LiveClientEvent, type LiveTranscriptEntry } from "../src/core/contracts/live.ts";
+import { sanitizeLiveTranscript, upsertLiveTranscript, type LiveClientEvent, type LiveTranscriptEntry } from "../src/core/contracts/live.ts";
 import { sideChatLessonDocument } from "../src/core/side-chat.ts";
 import { questionDisplayOptions } from "../src/core/question-core.ts";
 import {
@@ -23,6 +23,7 @@ import {
 import {
 	extractAssistantCommentary,
 	extractLiveSessionContext,
+	extractPriorVoiceTurns,
 	extractTurnSpokenSummary,
 	resolveSpokenInput,
 } from "../src/server/live/speech-extract.ts";
@@ -1131,4 +1132,217 @@ test("createLiveSessionManager seeds Codex live context once via commentary sess
 	const replayed = events.filter((e): e is Extract<LiveClientEvent, { type: "transcript" }> => e.type === "transcript").map((e) => e.entry);
 	assert.deepEqual(replayed, [{ role: "assistant", turn: 1, text: "Codeword is Osaka.", final: false }]);
 	await manager.stop("chat_seed");
+});
+
+test("createLiveSessionManager supports pause/resume wire control and phase updates", async () => {
+	let emitWire: (event: LiveWireEvent) => void = () => {};
+	const sentFrames: { type?: string }[] = [];
+
+	const manager = createLiveSessionManager({
+		getChat: () => ({ id: "chat_pause", title: "日本語", messages: [] }),
+		runChatInput: async () => new Response("", { status: 200 }),
+		steerChat: async () => "stale",
+		isRunning: () => false,
+		getRunningTurn: () => undefined,
+		getEndpoint: () => undefined,
+		refreshCodex: async () => {},
+		isCodexConnected: () => true,
+		leaseCodexAuth: async () => ({ accessToken: "tok", accountId: "acct" }),
+		watchCodexAbort: () => ({ controller: new AbortController(), release: () => {} }),
+		createTransport: (options) => {
+			emitWire = options.onEvent;
+			return {
+				sdpAnswer: "v=0\r\n",
+				connect: async () => {},
+				send: async (payload) => { sentFrames.push(payload as { type?: string }); },
+				close: async () => {},
+			};
+		},
+	});
+
+	assert.deepEqual(parseLiveWireEvent('{"type":"input_audio.paused"}'), { type: "input_audio.paused" });
+	assert.deepEqual(parseLiveWireEvent('{"type":"input_audio.resumed"}'), { type: "input_audio.resumed" });
+
+	const started = await manager.start({ chatId: "chat_pause", sdpOffer: "v=0\r\n" });
+	const stream = manager.subscribe("chat_pause", started.liveId);
+	assert(stream);
+	const reader = stream.getReader();
+	const decoder = new TextDecoder();
+	let raw = "";
+	const readEvents = async (target: number): Promise<LiveClientEvent[]> => {
+		const out: LiveClientEvent[] = [];
+		while (out.length < target) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			raw += decoder.decode(value, { stream: true });
+			let idx = raw.indexOf("\n\n");
+			while (idx !== -1) {
+				const frame = raw.slice(0, idx);
+				raw = raw.slice(idx + 2);
+				const dataLine = frame.split("\n").find((line) => line.startsWith("data: "));
+				if (dataLine) out.push(JSON.parse(dataLine.slice(6)) as LiveClientEvent);
+				idx = raw.indexOf("\n\n");
+			}
+		}
+		return out;
+	};
+
+	const initial = await readEvents(1);
+	assert.deepEqual(initial[0], { type: "phase", phase: "listening" });
+
+	assert.equal(await manager.setPaused("chat_pause", started.liveId, true), true);
+	assert.deepEqual(sentFrames.at(-1), { type: "input_audio.pause" });
+	const pausedEvt = await readEvents(1);
+	assert.deepEqual(pausedEvt[0], { type: "phase", phase: "paused" });
+
+	// Server-initiated resume ack transitions back to listening.
+	assert.equal(await manager.setPaused("chat_pause", started.liveId, false), true);
+	assert.deepEqual(sentFrames.at(-1), { type: "input_audio.resume" });
+	const resumedEvt = await readEvents(1);
+	assert.deepEqual(resumedEvt[0], { type: "phase", phase: "listening" });
+
+	// Wire-initiated pause also updates phase.
+	emitWire({ type: "input_audio.paused" });
+	const wirePaused = await readEvents(1);
+	assert.deepEqual(wirePaused[0], { type: "phase", phase: "paused" });
+	emitWire({ type: "input_audio.resumed" });
+	const wireResumed = await readEvents(1);
+	assert.deepEqual(wireResumed[0], { type: "phase", phase: "listening" });
+
+	await reader.cancel();
+	await manager.stop("chat_pause");
+});
+
+test("createLiveSessionManager persists voice transcript across restarts, appends turns monotonically, and seeds prior voice context", async () => {
+	let persistedTranscript: LiveTranscriptEntry[] = [];
+	let emitWire: (event: LiveWireEvent) => void = () => {};
+	const sentFrames: { type?: string; channel?: string; content?: { text?: string }[] }[] = [];
+
+	const manager = createLiveSessionManager({
+		getChat: () => ({
+			id: "chat_resume",
+			title: "日本語",
+			kind: "teach",
+			tree: { version: 1, nodes: [{ id: "verbs", title: "Verb basics" }], edges: [] },
+			messages: [{ id: "u1", role: "user", content: "Teach me Japanese.", timestamp: 1 }],
+			liveTranscript: persistedTranscript,
+		}),
+		saveLiveTranscript: (_chatId, entries) => {
+			persistedTranscript = entries;
+		},
+		runChatInput: async () => new Response("", { status: 200 }),
+		getLivePrompt: () => "Mix Japanese and English naturally.",
+		steerChat: async () => "stale",
+		isRunning: () => false,
+		getRunningTurn: () => undefined,
+		getEndpoint: () => undefined,
+		refreshCodex: async () => {},
+		isCodexConnected: () => true,
+		leaseCodexAuth: async () => ({ accessToken: "tok", accountId: "acct" }),
+		watchCodexAbort: () => ({ controller: new AbortController(), release: () => {} }),
+		createTransport: (options) => {
+			emitWire = options.onEvent;
+			return {
+				sdpAnswer: "v=0\r\n",
+				connect: async () => {
+					emitWire({ type: "session.started", session: { id: "rtc_resume" } });
+				},
+				send: async (payload) => {
+					sentFrames.push(payload as { type?: string; channel?: string; content?: { text?: string }[] });
+				},
+				close: async () => {},
+			};
+		},
+	});
+
+	// Session 1: speak one finalized turn and one partial turn, then stop.
+	await manager.start({ chatId: "chat_resume", sdpOffer: "v=0\r\n" });
+	emitWire({ type: "turn.done", turn: { role: "user", transcript: "Let's practice ordering ramen in Japanese." } });
+	emitWire({ type: "turn.created", turn: { id: "a1", role: "assistant", transcript: "Sure! Try saying ラーメンをください." } });
+	await manager.stop("chat_resume");
+
+	// Partial assistant turn should be finalized and persisted on stop.
+	assert.deepEqual(persistedTranscript, [
+		{ role: "user", turn: 1, text: "Let's practice ordering ramen in Japanese.", final: true },
+		{ role: "assistant", turn: 1, text: "Sure! Try saying ラーメンをください.", final: true },
+	]);
+	assert.deepEqual(manager.getTranscript("chat_resume"), persistedTranscript);
+
+	// Session 2: restart in the same chat; seed must include prior voice conversation and new turns must append as turn 2.
+	sentFrames.length = 0;
+	const restarted = await manager.start({ chatId: "chat_resume", sdpOffer: "v=0\r\n" });
+	await Promise.resolve();
+	const seedFrames = sentFrames.filter((f) => f.type === "session.context.append");
+	assert.equal(seedFrames.length, 1);
+	const seedText = seedFrames[0]?.content?.[0]?.text ?? "";
+	assert(estimateLiveContextTokens(seedText) <= LIVE_SESSION_SEED_MAX_TOKENS);
+	assert(seedText.includes("Prior voice chat (continue from here):"));
+	assert(seedText.includes("ordering ramen"));
+	assert(seedText.includes("ラーメンをください"));
+
+	emitWire({ type: "turn.done", turn: { role: "user", transcript: "What about asking for water too?" } });
+	emitWire({ type: "turn.done", turn: { role: "assistant", transcript: "Say お水をください!" } });
+
+	assert.deepEqual(persistedTranscript, [
+		{ role: "user", turn: 1, text: "Let's practice ordering ramen in Japanese.", final: true },
+		{ role: "assistant", turn: 1, text: "Sure! Try saying ラーメンをください.", final: true },
+		{ role: "user", turn: 2, text: "What about asking for water too?", final: true },
+		{ role: "assistant", turn: 2, text: "Say お水をください!", final: true },
+	]);
+
+	// Subscribe replays all 4 turns (session 1 + session 2) in order.
+	const stream = manager.subscribe("chat_resume", restarted.liveId);
+	assert(stream);
+	const reader = stream.getReader();
+	const decoder = new TextDecoder();
+	let raw = "";
+	const events: LiveClientEvent[] = [];
+	while (events.length < 5) {
+		const { value, done } = await reader.read();
+		if (done) break;
+		raw += decoder.decode(value, { stream: true });
+		let idx = raw.indexOf("\n\n");
+		while (idx !== -1) {
+			const frame = raw.slice(0, idx);
+			raw = raw.slice(idx + 2);
+			const dataLine = frame.split("\n").find((line) => line.startsWith("data: "));
+			if (dataLine) events.push(JSON.parse(dataLine.slice(6)) as LiveClientEvent);
+			idx = raw.indexOf("\n\n");
+		}
+	}
+	await reader.cancel();
+	const replayed = events.filter((e): e is Extract<LiveClientEvent, { type: "transcript" }> => e.type === "transcript").map((e) => e.entry);
+	assert.deepEqual(replayed, persistedTranscript);
+
+	// Clear transcript resets persisted store and live history.
+	assert.equal(manager.clearTranscript("chat_resume"), true);
+	assert.deepEqual(persistedTranscript, []);
+	assert.deepEqual(manager.getTranscript("chat_resume"), []);
+	await manager.stop("chat_resume");
+});
+
+test("buildTutorLiveSessionSeed prioritizes the most recent prior voice exchanges within the 410-token cap", () => {
+	const history: LiveTranscriptEntry[] = [];
+	for (let i = 1; i <= 12; i++) {
+		history.push(
+			{ role: "user", turn: i, text: `Voice topic number ${i} about Japanese grammar step ${i}.`, final: true },
+			{ role: "assistant", turn: i, text: `Tutor voice reply ${i} covering example ${i}.`, final: true },
+		);
+	}
+	const priorVoiceTurns = extractPriorVoiceTurns(sanitizeLiveTranscript(history));
+	assert(priorVoiceTurns);
+	const seed = buildTutorLiveSessionSeed({
+		sessionTitle: "日本語",
+		sessionKind: "teach",
+		compactMemory: 'started with "trying to learn japanese"; now on Verb basics',
+		planTitles: Array.from({ length: 15 }, (_, i) => `${i + 1}. Topic ${i + 1}`).join("; "),
+		activePrompt: "Question: Pick the right verb form.",
+		customInstructions: "Speak warmly and mix Japanese with English explanations.",
+		priorVoiceTurns,
+	});
+	assert(estimateLiveContextTokens(seed) <= LIVE_SESSION_SEED_MAX_TOKENS);
+	assert(seed.includes("Prior voice chat (continue from here):"));
+	assert(seed.includes("Tutor voice reply 12 covering example 12."));
+	assert(seed.includes("Voice topic number 12"));
+	assert(!seed.includes("Voice topic number 1 "));
 });

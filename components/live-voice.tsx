@@ -1,11 +1,12 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AudioLinesIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CopyIcon, Loader2Icon, MicIcon, MicOffIcon, SquareIcon, XIcon } from "lucide-react";
+import { AudioLinesIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CopyIcon, Loader2Icon, MicIcon, MicOffIcon, PauseIcon, PlayIcon, SquareIcon, XIcon } from "lucide-react";
 import {
 	DEFAULT_LIVE_VOICE,
 	LIVE_VOICES,
 	isLiveVoice,
+	sanitizeLiveTranscript,
 	upsertLiveTranscript,
 	type LiveAvailability,
 	type LiveClientEvent,
@@ -30,6 +31,7 @@ export interface LiveVoiceController {
 	available: boolean;
 	phase: LivePhase;
 	active: boolean;
+	paused: boolean;
 	muted: boolean;
 	voice: LiveVoiceId;
 	transcript: LiveTranscriptEntry | null;
@@ -38,6 +40,7 @@ export interface LiveVoiceController {
 	setVoice: (voice: LiveVoiceId) => void;
 	start: () => Promise<void>;
 	stop: () => Promise<void>;
+	togglePause: () => Promise<void>;
 	toggleMute: () => void;
 	clearError: () => void;
 	clearTranscript: () => void;
@@ -117,6 +120,7 @@ export function useLiveVoice({
 	const [available, setAvailable] = useState(false);
 	const [serverPhase, setServerPhase] = useState<LivePhase>("idle");
 	const [speaking, setSpeaking] = useState(false);
+	const [paused, setPaused] = useState(false);
 	const [muted, setMuted] = useState(false);
 	const [voice, setVoiceState] = useState<LiveVoiceId>(DEFAULT_LIVE_VOICE);
 	const [historyState, setHistoryState] = useState<{ chatId: string; entries: LiveTranscriptEntry[] }>(() => ({
@@ -132,12 +136,40 @@ export function useLiveVoice({
 	const speakHoldRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 	const eventSourceRef = useRef<EventSource | null>(null);
 	const liveIdRef = useRef<string | null>(null);
+	const pausedRef = useRef(false);
+	const mutedRef = useRef(false);
+	const transcriptGenRef = useRef(0);
 	const generationRef = useRef(0);
 	const startingRef = useRef(false);
 
 	useEffect(() => {
 		setVoiceState(readStoredVoice());
 	}, []);
+
+	useEffect(() => {
+		let cancelled = false;
+		const gen = ++transcriptGenRef.current;
+		void (async () => {
+			try {
+				const res = await fetch(`/api/chats/${encodeURIComponent(chatId)}/live`, { cache: "no-store" });
+				if (!res.ok || cancelled || transcriptGenRef.current !== gen) return;
+				const data = (await res.json()) as { transcript?: unknown };
+				if (cancelled || transcriptGenRef.current !== gen) return;
+				const persisted = sanitizeLiveTranscript(data.transcript, { markFinal: true });
+				setHistoryState((prev) => {
+					if (prev.chatId === chatId && prev.entries.length > 0) {
+						let merged = persisted;
+						for (const item of prev.entries) {
+							merged = upsertLiveTranscript(merged, item);
+						}
+						return { chatId, entries: merged };
+					}
+					return { chatId, entries: persisted };
+				});
+			} catch { /* ignore transient hydration failure */ }
+		})();
+		return () => { cancelled = true; };
+	}, [chatId]);
 
 	const refreshAvailability = useCallback(async () => {
 		try {
@@ -204,10 +236,13 @@ export function useLiveVoice({
 	const stop = useCallback(async () => {
 		generationRef.current += 1;
 		startingRef.current = false;
+		pausedRef.current = false;
+		mutedRef.current = false;
 		const activeId = liveIdRef.current;
 		liveIdRef.current = null;
 		teardownLocal();
 		setServerPhase("idle");
+		setPaused(false);
 		setMuted(false);
 		if (activeId) {
 			try {
@@ -250,7 +285,7 @@ export function useLiveVoice({
 				let sum = 0;
 				for (let i = 0; i < buffer.length; i++) sum += buffer[i]! * buffer[i]!;
 				const rms = Math.sqrt(sum / buffer.length);
-				if (rms > OUTPUT_ACTIVE_THRESHOLD) {
+				if (!pausedRef.current && rms > OUTPUT_ACTIVE_THRESHOLD) {
 					setSpeaking(true);
 					clearTimeout(speakHoldRef.current);
 					speakHoldRef.current = setTimeout(() => setSpeaking(false), OUTPUT_HOLD_MS);
@@ -268,8 +303,11 @@ export function useLiveVoice({
 		onBeforeStart?.();
 		startingRef.current = true;
 		const gen = ++generationRef.current;
+		pausedRef.current = false;
+		mutedRef.current = false;
 		setError(null);
-		setHistoryState({ chatId, entries: [] });
+		setHistoryState((prev) => (prev.chatId === chatId ? prev : { chatId, entries: [] }));
+		setPaused(false);
 		setMuted(false);
 		setServerPhase("connecting");
 		try {
@@ -295,10 +333,12 @@ export function useLiveVoice({
 				if (generationRef.current !== gen) return;
 				const remoteStream = event.streams[0] ?? new MediaStream([event.track]);
 				audio.srcObject = remoteStream;
-				void audio.play().catch(() => {});
+				audio.muted = pausedRef.current;
+				if (!pausedRef.current) {
+					void audio.play().catch(() => {});
+				}
 				monitorRemoteAudio(remoteStream);
 			};
-
 			pc.onconnectionstatechange = () => {
 				if (generationRef.current !== gen) return;
 				if (pc.connectionState === "failed") {
@@ -363,8 +403,11 @@ export function useLiveVoice({
 					} else if (event.type === "ended") {
 						if (event.error) setError(event.error);
 						liveIdRef.current = null;
+						pausedRef.current = false;
+						mutedRef.current = false;
 						teardownLocal();
 						setServerPhase("idle");
+						setPaused(false);
 						setMuted(false);
 					}
 				} catch { /* ignore malformed frame */ }
@@ -386,13 +429,70 @@ export function useLiveVoice({
 		}
 	}, [chatId, monitorRemoteAudio, onBeforeStart, stop, teardownLocal, voice]);
 
+	const togglePause = useCallback(async () => {
+		if (startingRef.current) return;
+		const nextPaused = !pausedRef.current;
+		const activeId = liveIdRef.current;
+		if (nextPaused) {
+			if (!activeId) return;
+			pausedRef.current = true;
+			setPaused(true);
+			setSpeaking(false);
+			setServerPhase("paused");
+			for (const track of streamRef.current?.getAudioTracks() ?? []) {
+				track.enabled = false;
+			}
+			if (audioRef.current) {
+				audioRef.current.muted = true;
+				try { audioRef.current.pause(); } catch { /* ignore */ }
+			}
+			try {
+				await fetch(`/api/chats/${encodeURIComponent(chatId)}/live`, {
+					method: "PATCH",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ liveId: activeId, paused: true }),
+				});
+			} catch { /* best-effort remote pause; local mic/audio stay paused */ }
+			return;
+		}
+
+		const pc = pcRef.current;
+		const canResumeLive = Boolean(activeId && pc && pc.connectionState !== "failed" && pc.connectionState !== "closed");
+		if (canResumeLive && activeId) {
+			try {
+				const res = await fetch(`/api/chats/${encodeURIComponent(chatId)}/live`, {
+					method: "PATCH",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ liveId: activeId, paused: false }),
+				});
+				if (res.ok) {
+					pausedRef.current = false;
+					setPaused(false);
+					for (const track of streamRef.current?.getAudioTracks() ?? []) {
+						track.enabled = !mutedRef.current;
+					}
+					if (audioRef.current) {
+						audioRef.current.muted = false;
+						void audioRef.current.play().catch(() => {});
+					}
+					setServerPhase("listening");
+					return;
+				}
+			} catch { /* fall through to reconnect */ }
+		}
+
+		await stop();
+		await start();
+	}, [chatId, start, stop]);
+
 	const toggleMute = useCallback(() => {
 		const stream = streamRef.current;
 		if (!stream) return;
 		setMuted((prev) => {
 			const next = !prev;
+			mutedRef.current = next;
 			for (const track of stream.getAudioTracks()) {
-				track.enabled = !next;
+				track.enabled = !next && !pausedRef.current;
 			}
 			return next;
 		});
@@ -400,7 +500,11 @@ export function useLiveVoice({
 
 	const clearError = useCallback(() => setError(null), []);
 	const clearTranscript = useCallback(() => {
+		transcriptGenRef.current += 1;
 		setHistoryState({ chatId, entries: [] });
+		void fetch(`/api/chats/${encodeURIComponent(chatId)}/live?clearTranscript=1`, {
+			method: "DELETE",
+		}).catch(() => {});
 	}, [chatId]);
 
 	const transcriptHistory = historyState.chatId === chatId ? historyState.entries : [];
@@ -411,18 +515,21 @@ export function useLiveVoice({
 		? "idle"
 		: serverPhase === "connecting"
 			? "connecting"
-			: muted
-				? "muted"
-				: serverPhase === "working"
-					? "working"
-					: speaking
-						? "speaking"
-						: serverPhase;
+			: paused || serverPhase === "paused"
+				? "paused"
+				: muted
+					? "muted"
+					: serverPhase === "working"
+						? "working"
+						: speaking
+							? "speaking"
+							: serverPhase;
 
 	return {
 		available,
 		phase: effectivePhase,
 		active,
+		paused,
 		muted,
 		voice,
 		transcript,
@@ -431,6 +538,7 @@ export function useLiveVoice({
 		setVoice,
 		start,
 		stop,
+		togglePause,
 		toggleMute,
 		clearError,
 		clearTranscript,
@@ -440,6 +548,7 @@ export function useLiveVoice({
 function phaseLabel(phase: LivePhase): string {
 	switch (phase) {
 		case "connecting": return "Connecting…";
+		case "paused": return "Paused";
 		case "working": return "Thinking…";
 		case "speaking": return "Speaking";
 		case "muted": return "Muted";
@@ -450,7 +559,7 @@ function phaseLabel(phase: LivePhase): string {
 }
 
 export function LiveVoiceBar({ live, disabled = false }: { live: LiveVoiceController; disabled?: boolean }) {
-	const { phase, active, muted, voice, error, setVoice, start, stop, toggleMute, clearError } = live;
+	const { phase, active, paused, muted, voice, transcriptHistory, error, setVoice, start, stop, togglePause, toggleMute, clearError } = live;
 	const { open: openSettings } = useSettingsDialog();
 	const [menuOpen, setMenuOpen] = useState(false);
 	const anchorRef = useRef<HTMLDivElement>(null);
@@ -458,11 +567,13 @@ export function LiveVoiceBar({ live, disabled = false }: { live: LiveVoiceContro
 	const popupLayer = usePopoverDismiss(anchorRef, menuOpen && !active, () => setMenuOpen(false), { layerRootRef: panelRef });
 	const needsCodex = error === LIVE_VOICE_NOT_CONNECTED;
 	const voiceLabel = LIVE_VOICES.find((v) => v.value === voice)?.label ?? voice;
+	const hasHistory = transcriptHistory.length > 0;
 
 	if (!active) {
+		const idleHint = error ?? (hasHistory ? `Resume Live Voice (${voiceLabel}) — continues transcript` : `Start Live Voice (${voiceLabel})`);
 		return (
 			<div ref={anchorRef} className="relative flex shrink-0 items-center" data-testid="live-voice-idle">
-				<Hint label={error ?? `Start Live Voice (${voiceLabel})`} side="top">
+				<Hint label={idleHint} side="top">
 					<button
 						type="button"
 						disabled={disabled}
@@ -474,12 +585,12 @@ export function LiveVoiceBar({ live, disabled = false }: { live: LiveVoiceContro
 								void start();
 							}
 						}}
-						aria-label={error ? `Live voice unavailable: ${error}` : "Start live voice"}
+						aria-label={error ? `Live voice unavailable: ${error}` : hasHistory ? "Resume live voice" : "Start live voice"}
 						data-testid="live-voice-toggle"
 						className="flex h-7 items-center justify-center gap-1.5 rounded-l-md border border-border/50 bg-card/50 px-2.5 text-xs text-muted-foreground/70 shadow-lg backdrop-blur transition-colors hover:border-border hover:text-muted-foreground disabled:opacity-50"
 					>
 						<AudioLinesIcon className="size-3.5 shrink-0" />
-						<span className="max-w-[11rem] truncate">{error ?? "Live"}</span>
+						<span className="max-w-[11rem] truncate">{error ?? (hasHistory ? "Resume" : "Live")}</span>
 					</button>
 				</Hint>
 				<Hint label={`Voice: ${voiceLabel}`} side="top">
@@ -535,11 +646,13 @@ export function LiveVoiceBar({ live, disabled = false }: { live: LiveVoiceContro
 				className={`size-1.5 shrink-0 rounded-full ${
 					phase === "connecting" || phase === "working"
 						? "animate-pulse bg-amber-500"
-						: phase === "speaking"
-							? "animate-pulse bg-emerald-500"
-							: phase === "muted"
-								? "bg-muted-foreground/50"
-								: "animate-pulse bg-sky-500"
+						: phase === "paused"
+							? "bg-amber-500/80"
+							: phase === "speaking"
+								? "animate-pulse bg-emerald-500"
+								: phase === "muted"
+									? "bg-muted-foreground/50"
+									: "animate-pulse bg-sky-500"
 				}`}
 			/>
 			<span className="truncate font-medium text-foreground" data-testid="live-voice-phase">
@@ -547,6 +660,23 @@ export function LiveVoiceBar({ live, disabled = false }: { live: LiveVoiceContro
 			</span>
 			<span className="hidden text-muted-foreground/70 sm:inline">· {voiceLabel}</span>
 			<div className="ml-auto flex items-center gap-1">
+				<Hint label={paused ? "Resume live voice" : "Pause live voice"} side="top">
+					<button
+						type="button"
+						disabled={phase === "connecting"}
+						onClick={() => void togglePause()}
+						aria-label={paused ? "Resume live voice" : "Pause live voice"}
+						data-testid="live-voice-pause"
+						className={`flex h-5 items-center gap-1 rounded px-1.5 transition-colors disabled:opacity-50 ${
+							paused
+								? "bg-amber-500/15 font-medium text-amber-600 hover:bg-amber-500/25 dark:text-amber-400"
+								: "text-muted-foreground hover:bg-accent hover:text-foreground"
+						}`}
+					>
+						{paused ? <PlayIcon className="size-2.5 fill-current" /> : <PauseIcon className="size-3" />}
+						<span>{paused ? "Resume" : "Pause"}</span>
+					</button>
+				</Hint>
 				<Hint label={muted ? "Unmute microphone" : "Mute microphone"} side="top">
 					<button
 						type="button"
@@ -594,10 +724,9 @@ export function LiveCaptionStrip({ live }: { live: LiveVoiceController }) {
 	const [copied, setCopied] = useState(false);
 	const listRef = useRef<HTMLDivElement>(null);
 	const copyTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-	const { transcript, transcriptHistory, phase, active, error } = live;
+	const { transcript, transcriptHistory, phase, active, paused, error } = live;
 	const hasHistory = transcriptHistory.length > 0;
 	const showTranscriptBody = hasHistory && !collapsed;
-
 	useEffect(() => {
 		return () => {
 			if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
@@ -659,7 +788,7 @@ export function LiveCaptionStrip({ live }: { live: LiveVoiceController }) {
 								</span>
 							) : showTranscriptBody ? (
 								<span className="font-medium text-foreground">
-									Live transcript ({transcriptHistory.length})
+									Live transcript ({transcriptHistory.length}){paused ? " · Paused" : ""}
 								</span>
 							) : transcript ? (
 								<>
@@ -672,11 +801,13 @@ export function LiveCaptionStrip({ live }: { live: LiveVoiceController }) {
 								<span>
 									{phase === "connecting"
 										? "Connecting to Codex Live Voice…"
-										: phase === "working"
-											? "Tutor is preparing a reply…"
-											: phase === "muted"
-												? "Microphone muted."
-												: "Live voice active — speak naturally in English or Japanese."}
+										: phase === "paused"
+											? "Live voice paused — click Resume to continue."
+											: phase === "working"
+												? "Tutor is preparing a reply…"
+												: phase === "muted"
+													? "Microphone muted."
+													: "Live voice active — speak naturally in English or Japanese."}
 								</span>
 							)}
 						</p>

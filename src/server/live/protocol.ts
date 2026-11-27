@@ -16,6 +16,7 @@ const attestationSessionId = randomUUID();
 export type LiveWireEvent =
 	| { type: "session.started" | "session.updated"; session: { id: string; instructions?: string } }
 	| { type: "session.context.appended" }
+	| { type: "input_audio.paused" | "input_audio.resumed" }
 	| { type: "output_audio.delta"; audio: string }
 	| { type: "input_transcript.added" | "output_transcript.added"; item: { text: string } }
 	| { type: "turn.created"; turn: { id: string; role: "user" | "assistant"; transcript: string } }
@@ -102,6 +103,10 @@ export function parseLiveWireEvent(raw: unknown): LiveWireEvent | null {
 		}
 		case "session.context.appended":
 			return { type: "session.context.appended" };
+		case "input_audio.paused":
+			return { type: "input_audio.paused" };
+		case "input_audio.resumed":
+			return { type: "input_audio.resumed" };
 		case "output_audio.delta": {
 			const res = AudioDeltaSchema.safeParse(parsed);
 			return res.success ? res.data : null;
@@ -192,6 +197,14 @@ export function buildDelegationContextAppend(delegationItemId: string, text: str
 		...(channel === undefined ? {} : { channel }),
 		content: [{ type: "input_text" as const, text }],
 	};
+}
+
+export function buildInputAudioPause() {
+	return { type: "input_audio.pause" as const };
+}
+
+export function buildInputAudioResume() {
+	return { type: "input_audio.resume" as const };
 }
 
 export function buildSessionClose() {
@@ -362,6 +375,7 @@ export function buildTutorLiveInstructions(context: {
 	customInstructions?: string;
 	planSummary?: string;
 	recentTurns?: string;
+	priorVoiceTurns?: string;
 	activePrompt?: string;
 }): string {
 	const topicLine = context.sessionTitle?.trim()
@@ -375,7 +389,7 @@ export function buildTutorLiveInstructions(context: {
 		topicLine,
 		pendingLine,
 		"Always delegate every substantive learner message, lesson request, question, practice prompt, or answer to the client backend so the lesson transcript, knowledge graph, plan, and quiz cards stay accurate.",
-		"If the learner is only greeting you, asking to repeat something just said or shown on screen, or asking what earlier context or lesson-plan topics you can see, you may answer directly from the session context below; otherwise create a client delegation immediately.",
+		"If the learner is only greeting you, asking to repeat something just said or shown on screen, or asking what earlier context, prior voice chat, or lesson-plan topics you can see, you may answer directly from the session context below; otherwise create a client delegation immediately.",
 		"If the learner speaks a new request while a turn is already running, create a new delegation to steer the same lesson.",
 		"Keep your spoken responses natural, concise, warm, and speech-friendly. Never read raw markdown syntax, URLs, backticks, or code fences aloud unless explicitly asked.",
 		"Match the language of the lesson naturally: when speaking Japanese (or any target language), pronounce words, example sentences, and phrases clearly and naturally in that language rather than spelling them out in romaji unless asked.",
@@ -401,6 +415,13 @@ export function buildTutorLiveInstructions(context: {
 			"",
 			"Recent conversation (context only — still delegate new substantive turns and answers to the backend):",
 			context.recentTurns.trim(),
+		);
+	}
+	if (context.priorVoiceTurns?.trim()) {
+		sections.push(
+			"",
+			"Prior Live Voice conversation in this session (pick up naturally from where you left off and remember what you already discussed aloud):",
+			context.priorVoiceTurns.trim(),
 		);
 	}
 	return sections.join("\n");
@@ -435,6 +456,29 @@ function truncateToLiveTokenBudget(text: string, maxTokens: number): string {
 	return `${out.trimEnd()}…`;
 }
 
+/** Select the most recent entries from a multi-turn block that fit within `maxTokens`,
+ *  so restarted voice sessions always preserve the latest exchanges instead of truncating them. */
+function selectTailEntriesToTokenBudget(raw: string, maxTokens: number, separator: string = " | "): string {
+	if (maxTokens <= 0) return "";
+	const parts = raw
+		.split(/\n+/)
+		.map((part) => part.replace(/\s+/g, " ").trim())
+		.filter(Boolean);
+	if (parts.length === 0) return "";
+	const selected: string[] = [];
+	for (let i = parts.length - 1; i >= 0; i--) {
+		const candidate = [parts[i]!, ...selected].join(separator);
+		if (estimateLiveContextTokens(candidate) <= maxTokens) {
+			selected.unshift(parts[i]!);
+		} else if (selected.length === 0) {
+			return truncateToLiveTokenBudget(parts[i]!, maxTokens);
+		} else {
+			break;
+		}
+	}
+	return selected.join(separator);
+}
+
 /** Build a single commentary `session.context.append` payload safely under OpenAI's
  *  500-token limit because `POST /codex/realtime/calls` drops `session.instructions`. */
 export function buildTutorLiveSessionSeed(context: {
@@ -443,9 +487,11 @@ export function buildTutorLiveSessionSeed(context: {
 	compactMemory?: string;
 	planTitles?: string;
 	recentTurns?: string;
+	priorVoiceTurns?: string;
 	activePrompt?: string;
 	customInstructions?: string;
 }): string {
+	const priorVoiceRaw = context.priorVoiceTurns?.trim();
 	const lines: string[] = [
 		"Background context for this LearnHarness session (stay silent until the learner speaks). You and LearnHarness are one tutor.",
 	];
@@ -456,13 +502,13 @@ export function buildTutorLiveSessionSeed(context: {
 		: `Session: ${title} (${kind}).`;
 	lines.push(sessionLine);
 	if (context.planTitles?.trim()) {
-		lines.push(`Plan: ${truncateToLiveTokenBudget(context.planTitles, 95)}`);
+		lines.push(`Plan: ${truncateToLiveTokenBudget(context.planTitles, priorVoiceRaw ? 65 : 90)}`);
 	}
 	if (context.activePrompt?.trim()) {
-		lines.push(`Open on screen (never reveal answer): ${truncateToLiveTokenBudget(context.activePrompt, 55)}`);
+		lines.push(`Open on screen (never reveal answer): ${truncateToLiveTokenBudget(context.activePrompt, priorVoiceRaw ? 45 : 55)}`);
 	}
 	lines.push(
-		"Rules: Answer questions about session context, history, plan, or preferences directly from this background. Delegate new lesson turns, quiz answers, or deep clarifications to the client backend.",
+		'Rules: Use this background (and prior voice chat) as your own memory; delegate new lesson turns/answers. Speak "Agent Final Message": replies naturally without saying the label.',
 	);
 
 	const usedSoFar = () => estimateLiveContextTokens(lines.join("\n"));
@@ -471,22 +517,47 @@ export function buildTutorLiveSessionSeed(context: {
 	const remaining = LIVE_SESSION_SEED_MAX_TOKENS - usedSoFar();
 
 	if (remaining > 20) {
-		if (prefRaw && recentRaw) {
+		if (priorVoiceRaw) {
+			const hasOther = Boolean(prefRaw || recentRaw);
+			const priorBudget = hasOther
+				? Math.min(remaining - 10, Math.max(110, Math.floor(remaining * 0.62)))
+				: remaining - 10;
+			const prior = selectTailEntriesToTokenBudget(priorVoiceRaw, priorBudget);
+			if (prior) lines.push(`Prior voice chat (continue from here): ${prior}`);
+			const left = LIVE_SESSION_SEED_MAX_TOKENS - usedSoFar();
+			if (left > 18) {
+				if (prefRaw && recentRaw) {
+					const prefBudget = Math.floor(left * 0.6) - 5;
+					const pref = truncateToLiveTokenBudget(prefRaw, prefBudget);
+					if (pref) lines.push(`User preferences: ${pref}`);
+					const recentBudget = LIVE_SESSION_SEED_MAX_TOKENS - usedSoFar() - 4;
+					const recent = selectTailEntriesToTokenBudget(recentRaw, recentBudget);
+					if (recent) lines.push(`Recent: ${recent}`);
+				} else if (prefRaw) {
+					const pref = truncateToLiveTokenBudget(prefRaw, left - 5);
+					if (pref) lines.push(`User preferences: ${pref}`);
+				} else if (recentRaw) {
+					const recent = selectTailEntriesToTokenBudget(recentRaw, left - 4);
+					if (recent) lines.push(`Recent: ${recent}`);
+				}
+			}
+		} else if (prefRaw && recentRaw) {
 			const prefBudget = Math.floor(remaining * 0.55);
-			const pref = truncateToLiveTokenBudget(prefRaw, prefBudget - 4);
+			const pref = truncateToLiveTokenBudget(prefRaw, prefBudget - 5);
 			if (pref) lines.push(`User preferences: ${pref}`);
 			const recentBudget = LIVE_SESSION_SEED_MAX_TOKENS - usedSoFar() - 4;
-			const tail = recentRaw.split(/\n\n+/).slice(-2).join(" | ");
-			const recent = truncateToLiveTokenBudget(tail, recentBudget);
+			const recent = selectTailEntriesToTokenBudget(recentRaw, recentBudget);
 			if (recent) lines.push(`Recent: ${recent}`);
 		} else if (prefRaw) {
-			const pref = truncateToLiveTokenBudget(prefRaw, remaining - 4);
+			const pref = truncateToLiveTokenBudget(prefRaw, remaining - 5);
 			if (pref) lines.push(`User preferences: ${pref}`);
 		} else if (recentRaw) {
-			const tail = recentRaw.split(/\n\n+/).slice(-3).join(" | ");
-			const recent = truncateToLiveTokenBudget(tail, remaining - 4);
+			const recent = selectTailEntriesToTokenBudget(recentRaw, remaining - 4);
 			if (recent) lines.push(`Recent: ${recent}`);
 		}
 	}
-	return truncateToLiveTokenBudget(lines.join("\n"), LIVE_SESSION_SEED_MAX_TOKENS);
+	const joined = lines.join("\n");
+	return estimateLiveContextTokens(joined) <= LIVE_SESSION_SEED_MAX_TOKENS
+		? joined
+		: truncateToLiveTokenBudget(joined, LIVE_SESSION_SEED_MAX_TOKENS);
 }

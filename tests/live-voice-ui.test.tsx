@@ -4,13 +4,14 @@ import React from "react";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import { LiveCaptionStrip, formatLiveTranscriptText, type LiveVoiceController } from "../components/live-voice.tsx";
-
+import { InteractionLayersProvider } from "../components/interaction-layers.tsx";
+import { LiveCaptionStrip, LiveVoiceBar, formatLiveTranscriptText, type LiveVoiceController } from "../components/live-voice.tsx";
 function mockLive(overrides: Partial<LiveVoiceController> = {}): LiveVoiceController {
 	return {
 		available: true,
 		phase: "listening",
 		active: true,
+		paused: false,
 		muted: false,
 		voice: "sol",
 		transcript: null,
@@ -19,6 +20,7 @@ function mockLive(overrides: Partial<LiveVoiceController> = {}): LiveVoiceContro
 		setVoice: () => {},
 		start: async () => {},
 		stop: async () => {},
+		togglePause: async () => {},
 		toggleMute: () => {},
 		clearError: () => {},
 		clearTranscript: () => {},
@@ -52,4 +54,55 @@ test("LiveCaptionStrip renders scrollable voice transcript history during and af
 		formatLiveTranscriptText(history),
 		"You: 食べなかったはどういう意味？\n\nTutor: It means didn't eat — negative plus past.",
 	);
+});
+
+test("LiveVoiceBar and LiveCaptionStrip render Pause/Resume states and Resume idle label when transcript persists", () => {
+	const history = [
+		{ role: "user" as const, turn: 1, text: "Let's practice ordering ramen.", final: true },
+		{ role: "assistant" as const, turn: 1, text: "Sure! Say ラーメンをください.", final: true },
+	];
+
+	const idleFreshHtml = renderToStaticMarkup(
+		<InteractionLayersProvider>
+			<LiveVoiceBar live={mockLive({ active: false, phase: "idle" })} />
+		</InteractionLayersProvider>,
+	);
+	assert.ok(idleFreshHtml.includes('aria-label="Start live voice"'));
+	assert.ok(idleFreshHtml.includes(">Live<"));
+
+	const idleResumeHtml = renderToStaticMarkup(
+		<InteractionLayersProvider>
+			<LiveVoiceBar live={mockLive({ active: false, phase: "idle", transcriptHistory: history })} />
+		</InteractionLayersProvider>,
+	);
+	assert.ok(idleResumeHtml.includes('aria-label="Resume live voice"'));
+	assert.ok(idleResumeHtml.includes(">Resume<"));
+
+	const activeListeningHtml = renderToStaticMarkup(
+		<InteractionLayersProvider>
+			<LiveVoiceBar live={mockLive({ active: true, phase: "listening", paused: false })} />
+		</InteractionLayersProvider>,
+	);
+	assert.ok(activeListeningHtml.includes('data-testid="live-voice-pause"'));
+	assert.ok(activeListeningHtml.includes('aria-label="Pause live voice"'));
+	assert.ok(activeListeningHtml.includes(">Pause<"));
+
+	const activePausedHtml = renderToStaticMarkup(
+		<InteractionLayersProvider>
+			<LiveVoiceBar live={mockLive({ active: true, phase: "paused", paused: true })} />
+		</InteractionLayersProvider>,
+	);
+	assert.ok(activePausedHtml.includes(">Paused<"));
+	assert.ok(activePausedHtml.includes('aria-label="Resume live voice"'));
+	assert.ok(activePausedHtml.includes(">Resume<"));
+
+	const pausedStripEmptyHtml = renderToStaticMarkup(
+		<LiveCaptionStrip live={mockLive({ active: true, phase: "paused", paused: true })} />,
+	);
+	assert.ok(pausedStripEmptyHtml.includes("Live voice paused — click Resume to continue."));
+
+	const pausedStripHistoryHtml = renderToStaticMarkup(
+		<LiveCaptionStrip live={mockLive({ active: true, phase: "paused", paused: true, transcriptHistory: history, transcript: history[1]! })} />,
+	);
+	assert.ok(pausedStripHistoryHtml.includes("Live transcript (2) · Paused"));
 });

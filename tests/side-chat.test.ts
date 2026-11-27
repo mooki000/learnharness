@@ -349,8 +349,23 @@ describe("side store seam", () => {
 		assert.equal(chatStore.getChat(chat.id)!.sideChats, undefined);
 		assert.equal(chatStore.updateSideChats("chat_missing", (t) => t), null);
 	});
-});
 
+	it("updates liveTranscript without touching messages, and listChats omits it", () => {
+		const chat = chatStore.createChat("voice-store");
+		chatStore.saveMessages(chat.id, [newUserMessage("hello")]);
+		const entry = { role: "user" as const, turn: 1, text: "こんにちは", final: true };
+		assert.equal(chatStore.updateLiveTranscript(chat.id, (list) => [...list, entry])?.length, 1);
+		chatStore.saveMessages(chat.id, [newUserMessage("hello"), newUserMessage("next")]);
+		const record = chatStore.getChat(chat.id)!;
+		assert.deepEqual(record.liveTranscript, [entry]);
+		assert.equal(record.messages.length, 2);
+		const summary = chatStore.listChats().find((c) => c.id === chat.id) as unknown as Record<string, unknown>;
+		assert.equal(summary.liveTranscript, undefined);
+		chatStore.updateLiveTranscript(chat.id, () => []);
+		assert.equal(chatStore.getChat(chat.id)!.liveTranscript, undefined);
+		assert.equal(chatStore.updateLiveTranscript("chat_missing", (list) => list), null);
+	});
+});
 // ── the service, end to end on the faux provider ────────────────────────────
 
 interface Ndjson {

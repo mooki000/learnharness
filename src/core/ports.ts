@@ -31,6 +31,7 @@ import type {
 	TurnUsage,
 	NotesSource,
 } from "./contracts.ts";
+import type { LiveTranscriptEntry } from "./contracts/live.ts";
 import type { UserSettings } from "./settings.ts";
 import type { Theme, ThemeFile } from "./themes.ts";
 
@@ -95,6 +96,11 @@ export interface ChatStore {
 	 *  side-chat service announces its own changes. Not conversation
 	 *  activity — updatedAt stays put. */
 	updateSideChats(id: string, update: (threads: SideChatThread[]) => SideChatThread[]): SideChatThread[] | null;
+	/** Read-modify-write the record's persisted Live Voice transcript in one
+	 *  synchronous section so voice turns never clobber concurrent message
+	 *  saves. Returns the stored entries, or null when the chat is unknown.
+	 *  Silent; does not bump updatedAt. */
+	updateLiveTranscript(id: string, update: (entries: LiveTranscriptEntry[]) => LiveTranscriptEntry[]): LiveTranscriptEntry[] | null;
 }
 
 // ─── GraphStore — the append-only evidence ledgers (data/graph) ──────────────

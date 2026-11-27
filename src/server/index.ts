@@ -70,6 +70,7 @@ export {
 	liveAvailabilityResponse,
 	handleLiveStartRequest,
 	handleLiveEventsRequest,
+	handleLivePauseRequest,
 	handleLiveStopRequest,
 	liveSessionManager,
 	createLiveSessionManager,
