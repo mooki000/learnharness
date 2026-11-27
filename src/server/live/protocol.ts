@@ -428,14 +428,21 @@ export function buildTutorLiveInstructions(context: {
 }
 
 /** Conservative upper-bound token estimate for Codex Realtime `session.context.append`
- *  (server hard limit: 500 tokens). Non-ASCII/CJK codepoints count as ~1.1 tokens each. */
-export const LIVE_SESSION_SEED_MAX_TOKENS = 410;
+ *  (server hard limit: 500 tokens). Splits ASCII letters/spaces (0.25), ASCII digits/symbols
+ *  (0.85), and non-ASCII/CJK codepoints (1.25) so prose prompts aren't over-truncated while
+ *  symbol-dense and CJK payloads still stay safely below 500 tokens. */
+export const LIVE_SESSION_SEED_MAX_TOKENS = 465;
+
+function liveContextCodepointCost(cp: number): number {
+	if ((cp >= 0x41 && cp <= 0x5a) || (cp >= 0x61 && cp <= 0x7a) || cp === 0x20) return 0.25;
+	if (cp <= 0x7f) return 0.85;
+	return 1.25;
+}
 
 export function estimateLiveContextTokens(text: string): number {
 	let total = 0;
 	for (const ch of text) {
-		const cp = ch.codePointAt(0) ?? 0;
-		total += cp <= 0x7f ? 0.3 : 1.1;
+		total += liveContextCodepointCost(ch.codePointAt(0) ?? 0);
 	}
 	return Math.ceil(total);
 }
@@ -448,7 +455,7 @@ function truncateToLiveTokenBudget(text: string, maxTokens: number): string {
 	let out = "";
 	const limit = Math.max(1, maxTokens - 2);
 	for (const ch of cleaned) {
-		const cost = (ch.codePointAt(0) ?? 0) <= 0x7f ? 0.3 : 1.1;
+		const cost = liveContextCodepointCost(ch.codePointAt(0) ?? 0);
 		if (used + cost > limit) break;
 		out += ch;
 		used += cost;
@@ -511,7 +518,7 @@ export function buildTutorLiveSessionSeed(context: {
 		'Rules: Use this background (and prior voice chat) as your own memory; delegate new lesson turns/answers. Speak "Agent Final Message": replies naturally without saying the label.',
 	);
 
-	const usedSoFar = () => estimateLiveContextTokens(lines.join("\n"));
+	const usedSoFar = () => estimateLiveContextTokens(lines.join(" "));
 	const prefRaw = context.customInstructions?.trim();
 	const recentRaw = context.recentTurns?.trim();
 	const remaining = LIVE_SESSION_SEED_MAX_TOKENS - usedSoFar();

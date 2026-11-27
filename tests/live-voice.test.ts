@@ -1388,3 +1388,24 @@ test("createLiveSessionManager deduplicates leading-space cumulative turn deltas
 	]);
 	await manager.stop("chat_dedup");
 });
+
+test("buildTutorLiveSessionSeed preserves realistic long English custom prompt within the 465-token cap", () => {
+	const longPrompt = [
+		"We are primarily using Live Voice for learning Japanese.",
+		"Use the full lesson plan as our guide when I ask where we are or what comes next.",
+		"Speak naturally in a mix of English and Japanese: explain grammar in English and use natural Japanese for drills.",
+		"Pronounce Japanese words clearly at a learner-friendly pace and never spell out romaji unless asked.",
+		"Give brief concrete feedback on spoken Japanese particles, verb forms, and politeness level.",
+		"TAIL_PREFERENCE_MARKER: keep replies concise and conversational.",
+	].join(" ");
+	const seed = buildTutorLiveSessionSeed({
+		sessionTitle: "日本語",
+		sessionKind: "teach",
+		compactMemory: 'started with "trying to learn japanese"; now on Verb basics',
+		customInstructions: longPrompt,
+		priorVoiceTurns: "Learner: Let's practice ordering ramen.\nTutor: Try saying ラーメンをください.",
+	});
+	assert(estimateLiveContextTokens(seed) <= LIVE_SESSION_SEED_MAX_TOKENS);
+	assert(seed.includes("TAIL_PREFERENCE_MARKER"));
+	assert(seed.includes("ラーメンをください"));
+});
