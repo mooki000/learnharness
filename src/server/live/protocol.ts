@@ -523,7 +523,7 @@ export function buildTutorLiveSessionSeed(context: {
 				? Math.min(remaining - 10, Math.max(110, Math.floor(remaining * 0.62)))
 				: remaining - 10;
 			const prior = selectTailEntriesToTokenBudget(priorVoiceRaw, priorBudget);
-			if (prior) lines.push(`Prior voice chat (continue from here): ${prior}`);
+			if (prior) lines.push(`Prior voice chat (memory only; wait for learner): ${prior}`);
 			const left = LIVE_SESSION_SEED_MAX_TOKENS - usedSoFar();
 			if (left > 18) {
 				if (prefRaw && recentRaw) {
@@ -556,8 +556,5 @@ export function buildTutorLiveSessionSeed(context: {
 			if (recent) lines.push(`Recent: ${recent}`);
 		}
 	}
-	const joined = lines.join("\n");
-	return estimateLiveContextTokens(joined) <= LIVE_SESSION_SEED_MAX_TOKENS
-		? joined
-		: truncateToLiveTokenBudget(joined, LIVE_SESSION_SEED_MAX_TOKENS);
+	return truncateToLiveTokenBudget(lines.join(" "), LIVE_SESSION_SEED_MAX_TOKENS);
 }

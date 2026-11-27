@@ -1276,7 +1276,7 @@ test("createLiveSessionManager persists voice transcript across restarts, append
 	assert.equal(seedFrames.length, 1);
 	const seedText = seedFrames[0]?.content?.[0]?.text ?? "";
 	assert(estimateLiveContextTokens(seedText) <= LIVE_SESSION_SEED_MAX_TOKENS);
-	assert(seedText.includes("Prior voice chat (continue from here):"));
+	assert(seedText.includes("Prior voice chat (memory only; wait for learner):"));
 	assert(seedText.includes("ordering ramen"));
 	assert(seedText.includes("ラーメンをください"));
 
@@ -1341,8 +1341,50 @@ test("buildTutorLiveSessionSeed prioritizes the most recent prior voice exchange
 		priorVoiceTurns,
 	});
 	assert(estimateLiveContextTokens(seed) <= LIVE_SESSION_SEED_MAX_TOKENS);
-	assert(seed.includes("Prior voice chat (continue from here):"));
+	assert(seed.includes("Prior voice chat (memory only; wait for learner):"));
 	assert(seed.includes("Tutor voice reply 12 covering example 12."));
 	assert(seed.includes("Voice topic number 12"));
 	assert(!seed.includes("Voice topic number 1 "));
+});
+
+test("createLiveSessionManager deduplicates leading-space cumulative turn deltas and splits interrupted turns cleanly", async () => {
+	let emitWire: (event: LiveWireEvent) => void = () => {};
+	let persisted: LiveTranscriptEntry[] = [];
+
+	const manager = createLiveSessionManager({
+		getChat: () => ({ id: "chat_dedup", title: "日本語", messages: [], liveTranscript: persisted }),
+		saveLiveTranscript: (_chatId, entries) => { persisted = entries; },
+		runChatInput: async () => new Response("", { status: 200 }),
+		steerChat: async () => "stale",
+		isRunning: () => false,
+		getRunningTurn: () => undefined,
+		getEndpoint: () => undefined,
+		refreshCodex: async () => {},
+		isCodexConnected: () => true,
+		leaseCodexAuth: async () => ({ accessToken: "tok", accountId: "acct" }),
+		watchCodexAbort: () => ({ controller: new AbortController(), release: () => {} }),
+		createTransport: (options) => {
+			emitWire = options.onEvent;
+			return {
+				sdpAnswer: "v=0\r\n",
+				connect: async () => {},
+				send: async () => {},
+				close: async () => {},
+			};
+		},
+	});
+
+	await manager.start({ chatId: "chat_dedup", sdpOffer: "v=0\r\n" });
+	// Leading-space cumulative delta must replace, not duplicate the prefix.
+	emitWire({ type: "turn.created", turn: { id: "a1", role: "assistant", transcript: "了解。好きなスナック" } });
+	emitWire({ type: "turn.delta", turnId: "a1", delta: " 了解。好きなスナックは味噌ラーメン" });
+	// New turn.created before turn.done finalizes a1 and starts turn 2 instead of concatenating.
+	emitWire({ type: "turn.created", turn: { id: "a2", role: "assistant", transcript: "次はどうしようか？" } });
+	emitWire({ type: "turn.done", turn: { id: "a2", role: "assistant", transcript: "次はどうしようか？" } });
+
+	assert.deepEqual(persisted, [
+		{ role: "assistant", turn: 1, text: "了解。好きなスナックは味噌ラーメン", final: true },
+		{ role: "assistant", turn: 2, text: "次はどうしようか？", final: true },
+	]);
+	await manager.stop("chat_dedup");
 });

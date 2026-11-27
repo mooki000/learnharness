@@ -127,6 +127,8 @@ interface ManagedLiveSession {
 	assistantText: string;
 	assistantFinal: boolean;
 	assistantTurn: number;
+	activeUserTurnId?: string;
+	activeAssistantTurnId?: string;
 	turnRoles: Map<string, "user" | "assistant">;
 	started: boolean;
 	connected: boolean;
@@ -348,19 +350,22 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 		if (!delta) return;
 		const current = role === "user" ? session.userText : session.assistantText;
 		const isFinal = role === "user" ? session.userFinal : session.assistantFinal;
+		const trimmedDelta = delta.trimStart();
 		let next: string;
 		if (!current) {
 			if (role === "user") session.userTurn += 1;
 			else session.assistantTurn += 1;
 			next = delta;
 		} else if (isFinal) {
-			if (delta === current || current.endsWith(delta)) return;
+			if (trimmedDelta === current || (trimmedDelta.length > 0 && current.endsWith(trimmedDelta))) return;
 			if (role === "user") session.userTurn += 1;
 			else session.assistantTurn += 1;
 			next = delta;
 		} else if (delta.startsWith(current)) {
 			next = delta;
-		} else if (current.endsWith(delta)) {
+		} else if (trimmedDelta.startsWith(current)) {
+			next = trimmedDelta;
+		} else if (current.endsWith(delta) || (trimmedDelta.length > 0 && current.endsWith(trimmedDelta))) {
 			next = current;
 		} else {
 			next = current + delta;
@@ -702,19 +707,32 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 				case "output_transcript.added":
 					applyTranscriptDelta(session, "assistant", event.item.text);
 					break;
-				case "turn.created":
+				case "turn.created": {
 					session.turnRoles.set(event.turn.id, event.turn.role);
+					const activeId = event.turn.role === "user" ? session.activeUserTurnId : session.activeAssistantTurnId;
+					const current = event.turn.role === "user" ? session.userText : session.assistantText;
+					const isFinal = event.turn.role === "user" ? session.userFinal : session.assistantFinal;
+					if (activeId && activeId !== event.turn.id && current && !isFinal) {
+						emitTranscript(session, event.turn.role, current, true);
+					}
+					if (event.turn.role === "user") session.activeUserTurnId = event.turn.id;
+					else session.activeAssistantTurnId = event.turn.id;
 					if (event.turn.transcript) {
 						applyTranscriptDelta(session, event.turn.role, event.turn.transcript);
 					}
 					break;
+				}
 				case "turn.delta": {
 					const role = session.turnRoles.get(event.turnId);
 					if (role) applyTranscriptDelta(session, role, event.delta);
 					break;
 				}
 				case "turn.done":
-					if (event.turn.id) session.turnRoles.delete(event.turn.id);
+					if (event.turn.id) {
+						session.turnRoles.delete(event.turn.id);
+						if (event.turn.role === "user" && session.activeUserTurnId === event.turn.id) session.activeUserTurnId = undefined;
+						if (event.turn.role === "assistant" && session.activeAssistantTurnId === event.turn.id) session.activeAssistantTurnId = undefined;
+					}
 					applyTranscriptFinal(session, event.turn.role, event.turn.transcript);
 					break;
 				case "delegation.created": {
@@ -864,6 +882,8 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 			active.assistantText = "";
 			active.assistantFinal = false;
 			active.assistantTurn = 0;
+			active.activeUserTurnId = undefined;
+			active.activeAssistantTurnId = undefined;
 			active.transcriptDirty = false;
 		}
 		const exists = active !== undefined || deps.getChat(chatId) !== null;
