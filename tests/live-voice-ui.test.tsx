@@ -6,6 +6,7 @@ import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { InteractionLayersProvider } from "../components/interaction-layers.tsx";
 import { LiveCaptionStrip, LiveVoiceBar, formatLiveTranscriptText, type LiveVoiceController } from "../components/live-voice.tsx";
+import { StatsBar } from "../components/stats-bar.tsx";
 function mockLive(overrides: Partial<LiveVoiceController> = {}): LiveVoiceController {
 	return {
 		available: true,
@@ -105,4 +106,34 @@ test("LiveVoiceBar and LiveCaptionStrip render Pause/Resume states and Resume id
 		<LiveCaptionStrip live={mockLive({ active: true, phase: "paused", paused: true, transcriptHistory: history, transcript: history[1]! })} />,
 	);
 	assert.ok(pausedStripHistoryHtml.includes("Live transcript (2) · Paused"));
+});
+
+test("LiveVoiceBar uses container-scoped overflow-hidden layout so controls never wrap or bleed into StatsBar neighbors", () => {
+	const html = renderToStaticMarkup(
+		<InteractionLayersProvider>
+			<LiveVoiceBar live={mockLive({ active: true, phase: "listening", voice: "sol" })} />
+		</InteractionLayersProvider>,
+	);
+	const barTag = html.match(/<div[^>]*data-testid="live-voice-bar"[^>]*>/)?.[0] ?? "";
+	assert.ok(barTag.includes("@container"), "expected @container on live-voice-bar");
+	assert.ok(barTag.includes("overflow-hidden"), "expected overflow-hidden on live-voice-bar");
+	assert.ok(barTag.includes("justify-between"), "expected justify-between on live-voice-bar");
+	assert.ok(!barTag.includes("justify-center"), "justify-center overflows symmetrically when narrow");
+	assert.ok(html.includes("whitespace-nowrap"));
+	assert.ok(html.includes("@[250px]:inline"));
+	assert.ok(html.includes("@[168px]:inline"));
+	assert.ok(html.includes("@[322px]:inline"));
+
+	const statsHtml = renderToStaticMarkup(
+		<InteractionLayersProvider>
+			<StatsBar
+				turns={[]}
+				chatId="chat_narrow"
+				dictationSlot={<LiveVoiceBar live={mockLive({ active: true, phase: "listening", voice: "sol" })} />}
+			/>
+		</InteractionLayersProvider>,
+	);
+	const statsTag = statsHtml.match(/<div[^>]*data-testid="stats-bar"[^>]*>/)?.[0] ?? "";
+	assert.ok(statsTag.includes("flex-wrap"), "StatsBar must wrap on narrow viewports so End never clips");
+	assert.ok(statsHtml.includes("min-w-[7.5rem]"), "StatsBar dictationSlot must reserve minimum usable width before wrapping");
 });

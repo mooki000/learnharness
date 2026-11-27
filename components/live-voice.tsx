@@ -572,7 +572,11 @@ export function LiveVoiceBar({ live, disabled = false }: { live: LiveVoiceContro
 	if (!active) {
 		const idleHint = error ?? (hasHistory ? `Resume Live Voice (${voiceLabel}) — continues transcript` : `Start Live Voice (${voiceLabel})`);
 		return (
-			<div ref={anchorRef} className="relative flex shrink-0 items-center" data-testid="live-voice-idle">
+			<div
+				ref={anchorRef}
+				className={`relative flex min-w-0 items-center ${error ? "max-w-[65%]" : "max-w-full shrink-0"}`}
+				data-testid="live-voice-idle"
+			>
 				<Hint label={idleHint} side="top">
 					<button
 						type="button"
@@ -587,10 +591,10 @@ export function LiveVoiceBar({ live, disabled = false }: { live: LiveVoiceContro
 						}}
 						aria-label={error ? `Live voice unavailable: ${error}` : hasHistory ? "Resume live voice" : "Start live voice"}
 						data-testid="live-voice-toggle"
-						className="flex h-7 items-center justify-center gap-1.5 rounded-l-md border border-border/50 bg-card/50 px-2.5 text-xs text-muted-foreground/70 shadow-lg backdrop-blur transition-colors hover:border-border hover:text-muted-foreground disabled:opacity-50"
+						className="flex h-7 min-w-0 items-center justify-center gap-1.5 rounded-l-md border border-border/50 bg-card/50 px-2.5 text-xs text-muted-foreground/70 shadow-lg backdrop-blur transition-colors hover:border-border hover:text-muted-foreground disabled:opacity-50"
 					>
 						<AudioLinesIcon className="size-3.5 shrink-0" />
-						<span className="max-w-[11rem] truncate">{error ?? (hasHistory ? "Resume" : "Live")}</span>
+						<span className="max-w-[9rem] truncate whitespace-nowrap">{error ?? (hasHistory ? "Resume" : "Live")}</span>
 					</button>
 				</Hint>
 				<Hint label={`Voice: ${voiceLabel}`} side="top">
@@ -601,7 +605,7 @@ export function LiveVoiceBar({ live, disabled = false }: { live: LiveVoiceContro
 						aria-expanded={menuOpen}
 						data-testid="live-voice-picker"
 						onClick={() => setMenuOpen((o) => !o)}
-						className="flex h-7 items-center justify-center rounded-r-md border border-l-0 border-border/50 bg-card/50 px-1.5 text-xs text-muted-foreground/70 shadow-lg backdrop-blur transition-colors hover:border-border hover:text-muted-foreground disabled:opacity-50"
+						className="flex h-7 shrink-0 items-center justify-center rounded-r-md border border-l-0 border-border/50 bg-card/50 px-1.5 text-xs text-muted-foreground/70 shadow-lg backdrop-blur transition-colors hover:border-border hover:text-muted-foreground disabled:opacity-50"
 					>
 						<ChevronDownIcon className="size-3" />
 					</button>
@@ -639,27 +643,34 @@ export function LiveVoiceBar({ live, disabled = false }: { live: LiveVoiceContro
 	return (
 		<div
 			data-testid="live-voice-bar"
-			className="flex w-full min-w-0 items-center justify-center gap-2 rounded-md border border-border/60 bg-card/80 px-2.5 h-7 text-xs shadow-lg backdrop-blur"
+			className="@container flex h-7 w-full min-w-0 flex-1 items-center justify-between gap-1.5 overflow-hidden rounded-md border border-border/60 bg-card/80 px-2 text-xs shadow-lg backdrop-blur"
 		>
-			<span
-				aria-hidden
-				className={`size-1.5 shrink-0 rounded-full ${
-					phase === "connecting" || phase === "working"
-						? "animate-pulse bg-amber-500"
-						: phase === "paused"
-							? "bg-amber-500/80"
-							: phase === "speaking"
-								? "animate-pulse bg-emerald-500"
-								: phase === "muted"
-									? "bg-muted-foreground/50"
-									: "animate-pulse bg-sky-500"
-				}`}
-			/>
-			<span className="truncate font-medium text-foreground" data-testid="live-voice-phase">
-				{phaseLabel(phase)}
-			</span>
-			<span className="hidden text-muted-foreground/70 sm:inline">· {voiceLabel}</span>
-			<div className="ml-auto flex items-center gap-1">
+			<div
+				className="flex min-w-0 flex-1 items-center gap-1.5"
+				title={`${phaseLabel(phase)} · ${voiceLabel}`}
+			>
+				<span
+					aria-hidden
+					className={`size-1.5 shrink-0 rounded-full ${
+						phase === "connecting" || phase === "working"
+							? "animate-pulse bg-amber-500"
+							: phase === "paused"
+								? "bg-amber-500/80"
+								: phase === "speaking"
+									? "animate-pulse bg-emerald-500"
+									: phase === "muted"
+										? "bg-muted-foreground/50"
+										: "animate-pulse bg-sky-500"
+					}`}
+				/>
+				<span className="truncate font-medium text-foreground" data-testid="live-voice-phase">
+					{phaseLabel(phase)}
+				</span>
+				<span className="hidden shrink-0 whitespace-nowrap text-muted-foreground/70 @[322px]:inline">
+					· {voiceLabel}
+				</span>
+			</div>
+			<div className="flex shrink-0 items-center gap-1">
 				<Hint label={paused ? "Resume live voice" : "Pause live voice"} side="top">
 					<button
 						type="button"
@@ -667,14 +678,14 @@ export function LiveVoiceBar({ live, disabled = false }: { live: LiveVoiceContro
 						onClick={() => void togglePause()}
 						aria-label={paused ? "Resume live voice" : "Pause live voice"}
 						data-testid="live-voice-pause"
-						className={`flex h-5 items-center gap-1 rounded px-1.5 transition-colors disabled:opacity-50 ${
+						className={`flex h-5 shrink-0 items-center justify-center gap-1 whitespace-nowrap rounded px-1.5 transition-colors disabled:opacity-50 ${
 							paused
 								? "bg-amber-500/15 font-medium text-amber-600 hover:bg-amber-500/25 dark:text-amber-400"
 								: "text-muted-foreground hover:bg-accent hover:text-foreground"
 						}`}
 					>
-						{paused ? <PlayIcon className="size-2.5 fill-current" /> : <PauseIcon className="size-3" />}
-						<span>{paused ? "Resume" : "Pause"}</span>
+						{paused ? <PlayIcon className="size-2.5 shrink-0 fill-current" /> : <PauseIcon className="size-3 shrink-0" />}
+						<span className="hidden @[250px]:inline">{paused ? "Resume" : "Pause"}</span>
 					</button>
 				</Hint>
 				<Hint label={muted ? "Unmute microphone" : "Mute microphone"} side="top">
@@ -684,16 +695,20 @@ export function LiveVoiceBar({ live, disabled = false }: { live: LiveVoiceContro
 						onClick={toggleMute}
 						aria-label={muted ? "Unmute microphone" : "Mute microphone"}
 						data-testid="live-voice-mute"
-						className="flex h-5 items-center gap-1 rounded px-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
+						className={`flex h-5 shrink-0 items-center justify-center gap-1 whitespace-nowrap rounded px-1.5 transition-colors disabled:opacity-50 ${
+							muted
+								? "bg-accent font-medium text-destructive hover:bg-accent/80"
+								: "text-muted-foreground hover:bg-accent hover:text-foreground"
+						}`}
 					>
 						{phase === "connecting" ? (
-							<Loader2Icon className="size-3 animate-spin" />
+							<Loader2Icon className="size-3 shrink-0 animate-spin" />
 						) : muted ? (
-							<MicOffIcon className="size-3 text-destructive" />
+							<MicOffIcon className="size-3 shrink-0 text-destructive" />
 						) : (
-							<MicIcon className="size-3" />
+							<MicIcon className="size-3 shrink-0" />
 						)}
-						<span>{muted ? "Unmute" : "Mute"}</span>
+						<span className="hidden @[250px]:inline">{muted ? "Unmute" : "Mute"}</span>
 					</button>
 				</Hint>
 				<Hint label="End live voice" side="top">
@@ -702,10 +717,10 @@ export function LiveVoiceBar({ live, disabled = false }: { live: LiveVoiceContro
 						onClick={() => void stop()}
 						aria-label="End live voice"
 						data-testid="live-voice-stop"
-						className="flex h-5 items-center gap-1 rounded bg-destructive/10 px-1.5 font-medium text-destructive transition-colors hover:bg-destructive/20"
+						className="flex h-5 shrink-0 items-center justify-center gap-1 whitespace-nowrap rounded bg-destructive/10 px-1.5 font-medium text-destructive transition-colors hover:bg-destructive/20"
 					>
-						<SquareIcon className="size-2.5 fill-current" />
-						<span>End</span>
+						<SquareIcon className="size-2.5 shrink-0 fill-current" />
+						<span className="hidden @[168px]:inline">End</span>
 					</button>
 				</Hint>
 			</div>
