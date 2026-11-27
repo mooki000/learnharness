@@ -40,6 +40,7 @@ import {
 	type LiveWireEvent,
 } from "./protocol.ts";
 import {
+	buildCompactLiveMemorySummary,
 	extractAssistantCommentary,
 	extractLiveSessionContext,
 	extractTurnSpokenSummary,
@@ -211,21 +212,43 @@ async function consumeSideNdjson(stream: ReadableStream<Uint8Array>): Promise<{ 
 	};
 }
 
-function buildPendingFallbackContext(
+function truncateUtf8Bytes(text: string, maxBytes: number): string {
+	const trimmed = text.trim();
+	if (Buffer.byteLength(trimmed, "utf8") <= maxBytes) return trimmed;
+	const chunk = chunkUtf8(trimmed, Math.max(4, maxBytes - 3))[0] ?? "";
+	return `${chunk.trimEnd()}…`;
+}
+
+function buildPendingFallbackPayload(
 	record: { messages: readonly LhMessage[]; tree?: PlanTree },
 	baseHint: string,
 	sideError?: string,
-): string {
+): { commentary?: string; finalMessage: string } {
 	const ctx = extractLiveSessionContext(record);
-	const parts = [baseHint];
-	if (sideError?.trim()) {
-		parts.push(
-			`Note: The tutor model returned an error while handling this side question (${sideError.trim()}). Briefly mention this error if helpful, and answer what you can from the session context below without revealing quiz answers.`,
-		);
-	}
-	if (ctx.planSummary) parts.push(`Lesson plan overview:\n${ctx.planSummary}`);
-	if (ctx.recentTurns) parts.push(`Recent conversation:\n${ctx.recentTurns}`);
-	return parts.join("\n\n");
+	const commentaryParts: string[] = [];
+	if (ctx.planSummary) commentaryParts.push(`Lesson plan overview:\n${ctx.planSummary}`);
+	if (ctx.recentTurns) commentaryParts.push(`Recent conversation:\n${ctx.recentTurns}`);
+	commentaryParts.push(baseHint);
+
+	const shortError = sideError?.trim()
+		? truncateUtf8Bytes(sideError.trim().split(/\r?\n/, 1)[0] ?? "", 85)
+		: "";
+	const errorPart = shortError ? `Tutor model error: ${shortError} (switch models in this chat).` : "";
+	const instructionPart = "Answer directly from your session memory without spoiling any open quiz; only ask for a quiz pick if they are answering it.";
+	const fixedParts = [errorPart, instructionPart].filter(Boolean);
+	const fixedBytes = Buffer.byteLength(fixedParts.join(" "), "utf8");
+	const memoryPrefix = " Your session memory: ";
+	const memoryBudget = Math.max(0, 470 - fixedBytes - Buffer.byteLength(memoryPrefix, "utf8") - 1);
+	const rawMemory = buildCompactLiveMemorySummary(record);
+	const compactMemory = rawMemory && memoryBudget >= 24 ? truncateUtf8Bytes(rawMemory, memoryBudget) : "";
+	const finalMessage = compactMemory
+		? `${fixedParts.join(" ")}${memoryPrefix}${compactMemory}.`
+		: truncateUtf8Bytes(fixedParts.join(" "), 470);
+
+	return {
+		...(commentaryParts.length > 0 ? { commentary: commentaryParts.join("\n\n") } : {}),
+		finalMessage,
+	};
 }
 
 function logLiveDiagnostic(message: string): void {
@@ -326,7 +349,11 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 
 	async function sendDelegationText(session: ManagedLiveSession, delegationItemId: string, text: string, channel?: "commentary") {
 		if (session.ended || !session.transport) return;
-		for (const chunk of chunkUtf8(text)) {
+		const chunks = chunkUtf8(text);
+		if (channel === undefined) {
+			logLiveDiagnostic(`[live] delegation-final (${session.chatId}): bytes=${Buffer.byteLength(text, "utf8")} chunks=${chunks.length}`);
+		}
+		for (const chunk of chunks) {
 			if (session.ended || !session.transport) return;
 			await session.transport.send(buildDelegationContextAppend(delegationItemId, chunk, channel));
 		}
@@ -408,12 +435,15 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 					return;
 				}
 				logLiveDiagnostic(`[live] delegation (${session.chatId}): route=plugin-fallback`);
-				const fallback = buildPendingFallbackContext(
+				const fallback = buildPendingFallbackPayload(
 					recordBefore,
-					"There is an interactive question card waiting on screen. Answer any clarifying or lesson-plan question using the session context below without revealing answers, and remind the learner to complete or dismiss the card on screen.",
+					"There is an interactive question card waiting on screen. Answer any clarifying or lesson-plan question using the session context without revealing answers, and remind the learner to complete or dismiss the card on screen.",
 					sideResult.error,
 				);
-				await sendDelegationText(session, delegationItemId, formatAgentFinalMessage(fallback));
+				if (fallback.commentary) {
+					await sendDelegationText(session, delegationItemId, fallback.commentary, "commentary");
+				}
+				await sendDelegationText(session, delegationItemId, formatAgentFinalMessage(fallback.finalMessage));
 				return;
 			}
 
@@ -426,11 +456,11 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 					return;
 				}
 				logLiveDiagnostic(`[live] delegation (${session.chatId}): route=quiz-fallback`);
-				await sendDelegationText(
-					session,
-					delegationItemId,
-					formatAgentFinalMessage(buildPendingFallbackContext(recordBefore, resolution.promptHint, sideResult.error)),
-				);
+				const fallback = buildPendingFallbackPayload(recordBefore, resolution.promptHint, sideResult.error);
+				if (fallback.commentary) {
+					await sendDelegationText(session, delegationItemId, fallback.commentary, "commentary");
+				}
+				await sendDelegationText(session, delegationItemId, formatAgentFinalMessage(fallback.finalMessage));
 				return;
 			}
 
@@ -716,11 +746,19 @@ function defaultDeps(): LiveSessionDeps {
 	return {
 		getChat: (chatId) => stores.chatStore.getChat(chatId),
 		runChatInput: (chatId, input) => handleChatInput(chatId, input),
-		askSideQuestion: (chatId, text, anchorMessageId) => sideChats.ask(chatId, {
-			anchor: { messageId: anchorMessageId, partId: `${anchorMessageId}-t0`, blockIndex: 0, blockText: "" },
-			text,
-			quotes: [],
-		}),
+		askSideQuestion: (chatId, text, anchorMessageId) => {
+			const livePrompt = effectiveSettings().agent.livePrompt?.trim();
+			const extraInstructions = [
+				"## Live Voice delivery",
+				"This question was spoken in Live Voice. Reply concisely in 2-4 natural spoken sentences without markdown tables, code fences, or long lists so it reads cleanly aloud.",
+				...(livePrompt ? [`User Live Voice preferences:\n${livePrompt}`] : []),
+			].join("\n\n");
+			return sideChats.ask(chatId, {
+				anchor: { messageId: anchorMessageId, partId: `${anchorMessageId}-t0`, blockIndex: 0, blockText: "" },
+				text,
+				quotes: [],
+			}, { extraInstructions });
+		},
 		getLivePrompt: () => effectiveSettings().agent.livePrompt ?? undefined,
 		steerChat: (chatId, text) => prepareAndSteerChat(chatId, { type: "steer", id: `steer_${randomUUID()}`, text }),
 		isRunning: (chatId) => isTurnRunning(chatId),

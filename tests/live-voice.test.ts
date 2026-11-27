@@ -744,10 +744,10 @@ test("createLiveSessionManager routes non-answer spoken questions during an open
 	await manager.stop("chat_quiz_side");
 });
 
-test("createLiveSessionManager includes plan and recent turns in quiz fallback when sideChats is unavailable", async () => {
+test("createLiveSessionManager sends plan and recent turns via commentary and fits quiz fallback final reply in one chunk", async () => {
 	let emitWire: (event: LiveWireEvent) => void = () => {};
-	const sentFrames: { content?: { text?: string }[] }[] = [];
-	const frameSent = Promise.withResolvers<void>();
+	const sentFrames: { channel?: string; content?: { text?: string }[] }[] = [];
+	const finalSent = Promise.withResolvers<void>();
 
 	const manager = createLiveSessionManager({
 		getChat: () => ({
@@ -789,8 +789,9 @@ test("createLiveSessionManager includes plan and recent turns in quiz fallback w
 				sdpAnswer: "v=0\r\n",
 				connect: async () => {},
 				send: async (payload) => {
-					sentFrames.push(payload as { content?: { text?: string }[] });
-					frameSent.resolve();
+					const frame = payload as { channel?: string; content?: { text?: string }[] };
+					sentFrames.push(frame);
+					if (frame.channel === undefined) finalSent.resolve();
 				},
 				close: async () => {},
 			};
@@ -802,13 +803,19 @@ test("createLiveSessionManager includes plan and recent turns in quiz fallback w
 		type: "delegation.created",
 		item: { type: "delegation", target: "client", id: "del_fb_1", content: [{ type: "input_text", text: "What's in our plan?" }] },
 	});
-	await frameSent.promise;
-	const text = sentFrames[0]?.content?.[0]?.text ?? "";
-	assert(text.includes("Lesson plan overview:"));
-	assert(text.includes("Verb basics"));
-	assert(text.includes("Recent conversation:"));
-	assert(text.includes("ない marks negation."));
-	assert(!text.includes("SECRET"));
+	await finalSent.promise;
+	const commentaryText = sentFrames.filter((f) => f.channel === "commentary").map((f) => f.content?.[0]?.text ?? "").join("");
+	const finalFrames = sentFrames.filter((f) => f.channel === undefined);
+	assert.equal(finalFrames.length, 1, "fallback Agent Final Message fits in a single 500-byte chunk");
+	const finalText = finalFrames[0]?.content?.[0]?.text ?? "";
+	assert(Buffer.byteLength(finalText, "utf8") <= 500);
+	assert(commentaryText.includes("Lesson plan overview:"));
+	assert(commentaryText.includes("Recent conversation:"));
+	assert(commentaryText.includes("ない marks negation."));
+	assert(finalText.includes("Let's study verb negation."));
+	assert(finalText.includes("Verb basics"));
+	assert(!commentaryText.includes("SECRET"));
+	assert(!finalText.includes("SECRET"));
 	await manager.stop("chat_quiz_fb");
 });
 
@@ -859,12 +866,13 @@ test("extractLiveSessionContext keeps opening learner goal when history exceeds 
 	assert(snapshot.recentTurns?.includes("Follow-up question 15."));
 });
 
-test("createLiveSessionManager surfaces side-chat provider errors in quiz fallback context", async () => {
+test("createLiveSessionManager surfaces side-chat provider errors and earlier context in a single-chunk fallback reply", async () => {
 	let emitWire: (event: LiveWireEvent) => void = () => {};
-	const sentFrames: { content?: { text?: string }[] }[] = [];
-	const frameSent = Promise.withResolvers<void>();
+	const sentFrames: { channel?: string; content?: { text?: string }[] }[] = [];
+	const finalSent = Promise.withResolvers<void>();
 
 	const messages: LhMessage[] = [
+		{ id: "u_init", role: "user", content: "trying to learn japanese grammar from the beginning", timestamp: 1 },
 		{
 			...assistantMessage([
 				{ type: "toolCall", id: "send_e", name: "send_to_user", arguments: { message: "Check verb past negative." } },
@@ -887,13 +895,25 @@ test("createLiveSessionManager surfaces side-chat provider errors in quiz fallba
 	];
 
 	const manager = createLiveSessionManager({
-		getChat: () => ({ id: "chat_side_err", title: "日本語", messages }),
+		getChat: () => ({
+			id: "chat_side_err",
+			title: "日本語",
+			tree: {
+				version: 1,
+				nodes: [
+					{ id: "roles", title: "Particles" },
+					{ id: "verbs", title: "Verb basics" },
+				],
+				edges: [{ from: "roles", to: "verbs" }],
+			},
+			messages,
+		}),
 		runChatInput: async () => new Response("", { status: 200 }),
 		askSideQuestion: async () => {
 			const ndjson = JSON.stringify({
 				type: "done",
 				thread: {
-					messages: [{ role: "assistant", text: "", error: "Claude usage limit reached." }],
+					messages: [{ role: "assistant", text: "", error: "Claude usage limit reached. Check your provider account and try again later." }],
 				},
 			}) + "\n";
 			return new Response(ndjson, { status: 200, headers: { "Content-Type": "application/x-ndjson" } });
@@ -912,8 +932,9 @@ test("createLiveSessionManager surfaces side-chat provider errors in quiz fallba
 				sdpAnswer: "v=0\r\n",
 				connect: async () => {},
 				send: async (payload) => {
-					sentFrames.push(payload as { content?: { text?: string }[] });
-					frameSent.resolve();
+					const frame = payload as { channel?: string; content?: { text?: string }[] };
+					sentFrames.push(frame);
+					if (frame.channel === undefined) finalSent.resolve();
 				},
 				close: async () => {},
 			};
@@ -925,9 +946,15 @@ test("createLiveSessionManager surfaces side-chat provider errors in quiz fallba
 		type: "delegation.created",
 		item: { type: "delegation", target: "client", id: "del_err_1", content: [{ type: "input_text", text: "How far back can you see?" }] },
 	});
-	await frameSent.promise;
-	const text = sentFrames[0]?.content?.[0]?.text ?? "";
+	await finalSent.promise;
+	const finalFrames = sentFrames.filter((f) => f.channel === undefined);
+	assert.equal(finalFrames.length, 1);
+	const text = finalFrames[0]?.content?.[0]?.text ?? "";
+	assert(Buffer.byteLength(text, "utf8") <= 500);
 	assert(text.includes("Claude usage limit reached."));
+	assert(text.includes("only ask for a quiz pick if they are answering it."));
+	assert(text.includes("trying to learn japanese grammar from the beginning"));
+	assert(text.includes("Verb basics"));
 	assert(!text.includes("SECRET_EXPLANATION"));
 	await manager.stop("chat_side_err");
 });

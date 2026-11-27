@@ -342,7 +342,7 @@ export function buildTutorLiveInstructions(context: {
 		topicLine,
 		pendingLine,
 		"Always delegate every substantive learner message, lesson request, question, practice prompt, or answer to the client backend so the lesson transcript, knowledge graph, plan, and quiz cards stay accurate.",
-		"If the learner is only greeting you, asking to repeat something just said or shown on screen, or asking where they are in the lesson plan, you may answer directly from the session context below; otherwise create a client delegation immediately.",
+		"If the learner is only greeting you, asking to repeat something just said or shown on screen, or asking what earlier context or lesson-plan topics you can see, you may answer directly from the session context below; otherwise create a client delegation immediately.",
 		"If the learner speaks a new request while a turn is already running, create a new delegation to steer the same lesson.",
 		"Keep your spoken responses natural, concise, warm, and speech-friendly. Never read raw markdown syntax, URLs, backticks, or code fences aloud unless explicitly asked.",
 		"Match the language of the lesson naturally: when speaking Japanese (or any target language), pronounce words, example sentences, and phrases clearly and naturally in that language rather than spelling them out in romaji unless asked.",

@@ -619,3 +619,51 @@ export function extractLiveSessionContext(record: {
 		hasPendingQuestion,
 	};
 }
+
+/** Build a tight (<240 char), spoiler-free summary of session origin and plan progress
+ *  so fallback replies fit inside a single 500-byte Live Voice delegation chunk. */
+export function buildCompactLiveMemorySummary(record: {
+	messages: readonly LhMessage[];
+	tree?: PlanTree;
+}): string {
+	const parts: string[] = [];
+	const firstUser = record.messages.find((m): m is Extract<LhMessage, { role: "user" }> => m.role === "user");
+	const opening = firstUser ? collapseInline(extractUserMessageText(firstUser)) : "";
+	if (opening) {
+		parts.push(`started with "${truncateCodepoints(opening, 60)}"`);
+	}
+
+	let planItems: { title: string; status: "current" | "visited" | "upcoming" }[] = [];
+	if (record.tree && record.tree.nodes.length > 0) {
+		const statuses = derivePlanStatusesLh(record.tree, record.messages);
+		planItems = record.tree.nodes
+			.map((node) => ({ title: collapseInline(node.title), status: derivedNodeStatus(statuses, node.id) }))
+			.filter((item) => item.title.length > 0);
+	} else {
+		for (let i = record.messages.length - 1; i >= 0; i--) {
+			const message = record.messages[i]!;
+			if (message.role !== "custom" || message.customType !== "plan-block") continue;
+			const parsed = PlanBlockMarkerSchema.safeParse(message.details);
+			if (!parsed.success || parsed.data.block.nodes.length === 0) continue;
+			planItems = parsed.data.block.nodes
+				.map((node) => ({ title: collapseInline(node.title), status: node.status ?? "upcoming" }))
+				.filter((item) => item.title.length > 0);
+			break;
+		}
+	}
+
+	if (planItems.length > 0) {
+		const visited = planItems.filter((item) => item.status === "visited").map((item) => item.title);
+		const current = planItems.find((item) => item.status === "current")?.title;
+		const upcomingCount = planItems.filter((item) => item.status === "upcoming").length;
+		if (visited.length > 0) {
+			const shown = visited.slice(0, 4).join(", ");
+			const more = visited.length > 4 ? ` (+${visited.length - 4})` : "";
+			parts.push(`covered ${shown}${more}`);
+		}
+		if (current) parts.push(`now on ${truncateCodepoints(current, 45)}`);
+		if (upcomingCount > 0) parts.push(`${upcomingCount} topics ahead`);
+	}
+
+	return truncateCodepoints(parts.join("; "), 240);
+}

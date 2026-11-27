@@ -47,7 +47,7 @@ interface SideRun {
 }
 export interface SideChatService {
 	list(chatId: string): { threads: SideChatThread[]; answering: Record<string, string> } | null;
-	ask(chatId: string, input: SideAskInput): Promise<Response>;
+	ask(chatId: string, input: SideAskInput, options?: { extraInstructions?: string }): Promise<Response>;
 	watch(chatId: string, threadId: string): Response;
 	/** Pure snapshot, including current streamed text. The caller publishes
 	 * new deltas at model-request boundaries, without waiting for a helper. */
@@ -117,7 +117,7 @@ export function createSideChatService(deps: SideChatDeps): SideChatService {
 		return thread ? responseFor(chatId, thread, runs.get(runKey(chatId, threadId))) : Response.json({ error: "Unknown side conversation" }, { status: 404 });
 	}
 
-	async function ask(chatId: string, input: SideAskInput): Promise<Response> {
+	async function ask(chatId: string, input: SideAskInput, options?: { extraInstructions?: string }): Promise<Response> {
 		await deps.beforeAsk?.(chatId);
 		const initial = deps.chatStore.getChat(chatId);
 		if (!initial) return Response.json({ error: "Unknown chat" }, { status: 404 });
@@ -175,7 +175,9 @@ export function createSideChatService(deps: SideChatDeps): SideChatService {
 		const lesson = sideChatLessonDocument(record.messages, record.tree);
 		const turns = sideChatModelTurns(modelThread, lesson);
 		if (input.working?.trim()) turns[turns.length - 1]!.text += `\n\nLearner's current working (not submitted):\n${input.working.trim()}`;
-		const instructions = deps.instructions();
+		const baseInstructions = deps.instructions();
+		const extra = options?.extraInstructions?.trim();
+		const instructions = extra ? `${baseInstructions}\n\n${extra}` : baseInstructions;
 		const estimatedTokens = Math.ceil((instructions.length + turns.reduce((sum, turn) => sum + turn.text.length, 0)) / 4);
 		if (engine.model.contextWindow > 0 && estimatedTokens > Math.max(1, engine.model.contextWindow - Math.min(COMPACTION_RESERVE_TOKENS, engine.model.maxTokens))) {
 			return Response.json({ error: "This side conversation and lesson exceed the selected model's context window. Select a model with a larger context window." }, { status: 400 });
