@@ -8,10 +8,13 @@ import { questionDisplayOptions } from "../src/core/question-core.ts";
 import {
 	CODEX_LIVE_SIGNALING_URL,
 	DELEGATION_CHUNK_MAX_BYTES,
+	LIVE_SESSION_SEED_MAX_TOKENS,
 	buildCodexSidebandUrl,
 	buildFallbackAttestation,
 	buildTutorLiveInstructions,
+	buildTutorLiveSessionSeed,
 	chunkUtf8,
+	estimateLiveContextTokens,
 	extractAccountIdFromJwt,
 	extractCallIdFromLocation,
 	parseLiveWireEvent,
@@ -1032,4 +1035,100 @@ test("createLiveSessionManager accumulates transcript history and replays all tu
 		{ role: "assistant", turn: 1, text: "はい、どうぞ！", final: true },
 	]);
 	await manager.stop("chat_tr_hist");
+});
+
+test("buildTutorLiveSessionSeed stays under 500-token limit with dense Japanese and custom instructions", () => {
+	const seed = buildTutorLiveSessionSeed({
+		sessionTitle: "日本語",
+		sessionKind: "teach",
+		compactMemory: 'started with "trying to learn japanese grammar from the beginning"; covered Meaning, Particles; now on Verb basics; 10 topics ahead',
+		planTitles: Array.from({ length: 18 }, (_, i) => `${i + 1}. 日本語トピック${i + 1}`).join("; "),
+		activePrompt: "Question: 犬は見ない / 犬は見なかった",
+		recentTurns: "Learner: 食べなかったって過去否定？\n\nTutor: はい、ないの過去形はなかったです。",
+		customInstructions: "We are primarily using Live Voice for learning Japanese. ".repeat(30),
+	});
+	assert(estimateLiveContextTokens(seed) <= LIVE_SESSION_SEED_MAX_TOKENS);
+	assert(seed.includes("日本語"));
+	assert(seed.includes("Verb basics"));
+	assert(seed.includes("User preferences:"));
+});
+
+test("createLiveSessionManager seeds Codex live context once via commentary session.context.append and streams turn.created/turn.delta", async () => {
+	let emitWire: (event: LiveWireEvent) => void = () => {};
+	const sentFrames: { type?: string; channel?: string; content?: { text?: string }[] }[] = [];
+
+	const manager = createLiveSessionManager({
+		getChat: () => ({
+			id: "chat_seed",
+			title: "日本語",
+			kind: "teach",
+			tree: { version: 1, nodes: [{ id: "verbs", title: "Verb basics" }], edges: [] },
+			messages: [{ id: "u1", role: "user", content: "trying to learn japanese from the beginning", timestamp: 1 }],
+		}),
+		runChatInput: async () => new Response("", { status: 200 }),
+		getLivePrompt: () => "Mix Japanese and English naturally.",
+		steerChat: async () => "stale",
+		isRunning: () => false,
+		getRunningTurn: () => undefined,
+		getEndpoint: () => undefined,
+		refreshCodex: async () => {},
+		isCodexConnected: () => true,
+		leaseCodexAuth: async () => ({ accessToken: "tok", accountId: "acct" }),
+		watchCodexAbort: () => ({ controller: new AbortController(), release: () => {} }),
+		createTransport: (options) => {
+			emitWire = options.onEvent;
+			return {
+				sdpAnswer: "v=0\r\n",
+				connect: async () => {
+					// Simulate session.started arriving before connect() resolves
+					emitWire({ type: "session.started", session: { id: "rtc_test_1" } });
+				},
+				send: async (payload) => {
+					sentFrames.push(payload as { type?: string; channel?: string; content?: { text?: string }[] });
+				},
+				close: async () => {},
+			};
+		},
+	});
+
+	const started = await manager.start({ chatId: "chat_seed", sdpOffer: "v=0\r\n" });
+	// Wait one microtask for seed send
+	await Promise.resolve();
+	const seedFrames = sentFrames.filter((f) => f.type === "session.context.append");
+	assert.equal(seedFrames.length, 1);
+	assert.equal(seedFrames[0]?.channel, "commentary");
+	const seedText = seedFrames[0]?.content?.[0]?.text ?? "";
+	assert(seedText.includes("Verb basics"));
+	assert(seedText.includes("Mix Japanese and English naturally."));
+
+	// Verify turn.created + turn.delta wire parsing & streaming into transcript history
+	const created = parseLiveWireEvent(JSON.stringify({ type: "turn.created", turn: { id: "t1", role: "assistant", transcript: "Codeword" } }));
+	const delta = parseLiveWireEvent(JSON.stringify({ type: "turn.delta", turn_id: "t1", delta: " is Osaka." }));
+	assert(created && delta);
+	emitWire(created);
+	emitWire(delta);
+
+	const stream = manager.subscribe("chat_seed", started.liveId);
+	assert(stream);
+	const reader = stream.getReader();
+	const decoder = new TextDecoder();
+	let raw = "";
+	const events: LiveClientEvent[] = [];
+	while (events.length < 2) {
+		const { value, done } = await reader.read();
+		if (done) break;
+		raw += decoder.decode(value, { stream: true });
+		let idx = raw.indexOf("\n\n");
+		while (idx !== -1) {
+			const frame = raw.slice(0, idx);
+			raw = raw.slice(idx + 2);
+			const dataLine = frame.split("\n").find((line) => line.startsWith("data: "));
+			if (dataLine) events.push(JSON.parse(dataLine.slice(6)) as LiveClientEvent);
+			idx = raw.indexOf("\n\n");
+		}
+	}
+	await reader.cancel();
+	const replayed = events.filter((e): e is Extract<LiveClientEvent, { type: "transcript" }> => e.type === "transcript").map((e) => e.entry);
+	assert.deepEqual(replayed, [{ role: "assistant", turn: 1, text: "Codeword is Osaka.", final: false }]);
+	await manager.stop("chat_seed");
 });

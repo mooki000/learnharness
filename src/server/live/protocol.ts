@@ -15,13 +15,15 @@ const attestationSessionId = randomUUID();
 
 export type LiveWireEvent =
 	| { type: "session.started" | "session.updated"; session: { id: string; instructions?: string } }
+	| { type: "session.context.appended" }
 	| { type: "output_audio.delta"; audio: string }
 	| { type: "input_transcript.added" | "output_transcript.added"; item: { text: string } }
-	| { type: "turn.done"; turn: { role: "user" | "assistant"; transcript: string } }
+	| { type: "turn.created"; turn: { id: string; role: "user" | "assistant"; transcript: string } }
+	| { type: "turn.delta"; turnId: string; delta: string }
+	| { type: "turn.done"; turn: { id?: string; role: "user" | "assistant"; transcript: string } }
 	| { type: "delegation.created"; item: { type: "delegation"; target: "client"; id: string; content: { type: "input_text"; text: string }[] } }
 	| { type: "error"; message: string }
 	| { type: "unknown"; wireType: string };
-
 const SessionEventSchema = z.object({
 	type: z.enum(["session.started", "session.updated"]),
 	session: z.object({ id: z.string(), instructions: z.string().optional() }),
@@ -31,9 +33,18 @@ const TranscriptAddedSchema = z.object({
 	type: z.enum(["input_transcript.added", "output_transcript.added"]),
 	item: z.object({ text: z.string() }),
 });
+const TurnCreatedSchema = z.object({
+	type: z.literal("turn.created"),
+	turn: z.object({ id: z.string(), role: z.enum(["user", "assistant"]), transcript: z.string().optional() }),
+});
+const TurnDeltaSchema = z.object({
+	type: z.literal("turn.delta"),
+	turn_id: z.string(),
+	delta: z.string(),
+});
 const TurnDoneSchema = z.object({
 	type: z.literal("turn.done"),
-	turn: z.object({ role: z.enum(["user", "assistant"]), transcript: z.string() }),
+	turn: z.object({ id: z.string().optional(), role: z.enum(["user", "assistant"]), transcript: z.string() }),
 });
 const DelegationCreatedSchema = z.object({
 	type: z.literal("delegation.created"),
@@ -89,6 +100,8 @@ export function parseLiveWireEvent(raw: unknown): LiveWireEvent | null {
 					: { id: res.data.session.id },
 			};
 		}
+		case "session.context.appended":
+			return { type: "session.context.appended" };
 		case "output_audio.delta": {
 			const res = AudioDeltaSchema.safeParse(parsed);
 			return res.success ? res.data : null;
@@ -97,6 +110,18 @@ export function parseLiveWireEvent(raw: unknown): LiveWireEvent | null {
 		case "output_transcript.added": {
 			const res = TranscriptAddedSchema.safeParse(parsed);
 			return res.success ? res.data : null;
+		}
+		case "turn.created": {
+			const res = TurnCreatedSchema.safeParse(parsed);
+			if (!res.success) return null;
+			return {
+				type: "turn.created",
+				turn: { id: res.data.turn.id, role: res.data.turn.role, transcript: res.data.turn.transcript ?? "" },
+			};
+		}
+		case "turn.delta": {
+			const res = TurnDeltaSchema.safeParse(parsed);
+			return res.success ? { type: "turn.delta", turnId: res.data.turn_id, delta: res.data.delta } : null;
 		}
 		case "turn.done": {
 			const res = TurnDoneSchema.safeParse(parsed);
@@ -149,6 +174,14 @@ export function buildSessionUpdate(instructions: string, voice: LiveVoiceId) {
 			audio: { output: { voice } },
 			delegation: { type: "client" as const },
 		},
+	};
+}
+
+export function buildSessionContextAppend(text: string, channel?: "commentary") {
+	return {
+		type: "session.context.append" as const,
+		...(channel === undefined ? {} : { channel }),
+		content: [{ type: "input_text" as const, text }],
 	};
 }
 
@@ -371,4 +404,89 @@ export function buildTutorLiveInstructions(context: {
 		);
 	}
 	return sections.join("\n");
+}
+
+/** Conservative upper-bound token estimate for Codex Realtime `session.context.append`
+ *  (server hard limit: 500 tokens). Non-ASCII/CJK codepoints count as ~1.1 tokens each. */
+export const LIVE_SESSION_SEED_MAX_TOKENS = 410;
+
+export function estimateLiveContextTokens(text: string): number {
+	let total = 0;
+	for (const ch of text) {
+		const cp = ch.codePointAt(0) ?? 0;
+		total += cp <= 0x7f ? 0.3 : 1.1;
+	}
+	return Math.ceil(total);
+}
+
+function truncateToLiveTokenBudget(text: string, maxTokens: number): string {
+	const cleaned = text.replace(/\s+/g, " ").trim();
+	if (!cleaned || maxTokens <= 0) return "";
+	if (estimateLiveContextTokens(cleaned) <= maxTokens) return cleaned;
+	let used = 0;
+	let out = "";
+	const limit = Math.max(1, maxTokens - 2);
+	for (const ch of cleaned) {
+		const cost = (ch.codePointAt(0) ?? 0) <= 0x7f ? 0.3 : 1.1;
+		if (used + cost > limit) break;
+		out += ch;
+		used += cost;
+	}
+	return `${out.trimEnd()}…`;
+}
+
+/** Build a single commentary `session.context.append` payload safely under OpenAI's
+ *  500-token limit because `POST /codex/realtime/calls` drops `session.instructions`. */
+export function buildTutorLiveSessionSeed(context: {
+	sessionTitle?: string;
+	sessionKind?: string;
+	compactMemory?: string;
+	planTitles?: string;
+	recentTurns?: string;
+	activePrompt?: string;
+	customInstructions?: string;
+}): string {
+	const lines: string[] = [
+		"Background context for this LearnHarness session (stay silent until the learner speaks). You and LearnHarness are one tutor.",
+	];
+	const title = context.sessionTitle?.trim() || "Untitled";
+	const kind = context.sessionKind === "practice" ? "practice" : "teaching";
+	const sessionLine = context.compactMemory?.trim()
+		? `Session: ${title} (${kind}); ${context.compactMemory.trim()}.`
+		: `Session: ${title} (${kind}).`;
+	lines.push(sessionLine);
+	if (context.planTitles?.trim()) {
+		lines.push(`Plan: ${truncateToLiveTokenBudget(context.planTitles, 95)}`);
+	}
+	if (context.activePrompt?.trim()) {
+		lines.push(`Open on screen (never reveal answer): ${truncateToLiveTokenBudget(context.activePrompt, 55)}`);
+	}
+	lines.push(
+		"Rules: Answer questions about session context, history, plan, or preferences directly from this background. Delegate new lesson turns, quiz answers, or deep clarifications to the client backend.",
+	);
+
+	const usedSoFar = () => estimateLiveContextTokens(lines.join("\n"));
+	const prefRaw = context.customInstructions?.trim();
+	const recentRaw = context.recentTurns?.trim();
+	const remaining = LIVE_SESSION_SEED_MAX_TOKENS - usedSoFar();
+
+	if (remaining > 20) {
+		if (prefRaw && recentRaw) {
+			const prefBudget = Math.floor(remaining * 0.55);
+			const pref = truncateToLiveTokenBudget(prefRaw, prefBudget - 4);
+			if (pref) lines.push(`User preferences: ${pref}`);
+			const recentBudget = LIVE_SESSION_SEED_MAX_TOKENS - usedSoFar() - 4;
+			const tail = recentRaw.split(/\n\n+/).slice(-2).join(" | ");
+			const recent = truncateToLiveTokenBudget(tail, recentBudget);
+			if (recent) lines.push(`Recent: ${recent}`);
+		} else if (prefRaw) {
+			const pref = truncateToLiveTokenBudget(prefRaw, remaining - 4);
+			if (pref) lines.push(`User preferences: ${pref}`);
+		} else if (recentRaw) {
+			const tail = recentRaw.split(/\n\n+/).slice(-3).join(" | ");
+			const recent = truncateToLiveTokenBudget(tail, remaining - 4);
+			if (recent) lines.push(`Recent: ${recent}`);
+		}
+	}
+	return truncateToLiveTokenBudget(lines.join("\n"), LIVE_SESSION_SEED_MAX_TOKENS);
 }

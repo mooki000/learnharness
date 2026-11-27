@@ -33,8 +33,11 @@ import { isTurnRunning } from "../turn-liveness.ts";
 import { runningTurn } from "../turn-runs.ts";
 import {
 	buildDelegationContextAppend,
+	buildSessionContextAppend,
 	buildTutorLiveInstructions,
+	buildTutorLiveSessionSeed,
 	chunkUtf8,
+	estimateLiveContextTokens,
 	extractAccountIdFromJwt,
 	formatAgentFinalMessage,
 	type LiveWireEvent,
@@ -109,6 +112,10 @@ interface ManagedLiveSession {
 	assistantText: string;
 	assistantFinal: boolean;
 	assistantTurn: number;
+	turnRoles: Map<string, "user" | "assistant">;
+	started: boolean;
+	connected: boolean;
+	contextSeeded: boolean;
 	lastTranscript?: LiveTranscriptEntry;
 	transcriptHistory: LiveTranscriptEntry[];
 	subscribers: Set<(event: LiveClientEvent) => void>;
@@ -550,6 +557,14 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 			customInstructions,
 			...sessionContext,
 		});
+		const sessionSeed = endpoint
+			? undefined
+			: buildTutorLiveSessionSeed({
+				sessionTitle: freshRecord.title,
+				sessionKind: freshRecord.kind,
+				customInstructions,
+				...sessionContext,
+			});
 		const sessionAbort = new AbortController();
 		const codexWatcher = endpoint ? undefined : deps.watchCodexAbort();
 		const onCodexAbort = () => { void session.stop("OpenAI Codex connection changed or disconnected."); };
@@ -568,6 +583,10 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 			assistantText: "",
 			assistantFinal: false,
 			assistantTurn: 0,
+			turnRoles: new Map(),
+			started: false,
+			connected: false,
+			contextSeeded: false,
 			transcriptHistory: [],
 			subscribers: new Set(),
 			releaseAbort: () => {
@@ -594,14 +613,25 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 			},
 		};
 
+		const maybeSeedSessionContext = () => {
+			if (session.contextSeeded || !sessionSeed || !session.started || !session.connected || session.ended || !session.transport) return;
+			session.contextSeeded = true;
+			void session.transport.send(buildSessionContextAppend(sessionSeed, "commentary")).catch(() => {});
+		};
+
 		const onWireEvent = (event: LiveWireEvent) => {
 			if (session.ended) return;
 			switch (event.type) {
 				case "session.started":
+					session.started = true;
 					logLiveDiagnostic(
-						`[live] started (${params.chatId}, remote=${event.session.id}, sentInstr=${instructions.length}, echoedInstr=${event.session.instructions?.length ?? -1}, customInstr=${customInstructions?.length ?? 0}, plan=${sessionContext.planSummary?.length ?? 0}, recent=${sessionContext.recentTurns?.length ?? 0}, active=${sessionContext.activePrompt?.length ?? 0})`,
+						`[live] started (${params.chatId}, remote=${event.session.id}, seedChars=${sessionSeed?.length ?? 0}, seedEstTok=${sessionSeed ? estimateLiveContextTokens(sessionSeed) : 0}, customInstr=${customInstructions?.length ?? 0}, plan=${sessionContext.planSummary?.length ?? 0}, recent=${sessionContext.recentTurns?.length ?? 0}, active=${sessionContext.activePrompt?.length ?? 0})`,
 					);
+					maybeSeedSessionContext();
 					if (!session.activeDelegationId) setPhase(session, "listening");
+					break;
+				case "session.context.appended":
+					logLiveDiagnostic(`[live] context-seeded (${params.chatId})`);
 					break;
 				case "input_transcript.added":
 					applyTranscriptDelta(session, "user", event.item.text);
@@ -609,7 +639,19 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 				case "output_transcript.added":
 					applyTranscriptDelta(session, "assistant", event.item.text);
 					break;
+				case "turn.created":
+					session.turnRoles.set(event.turn.id, event.turn.role);
+					if (event.turn.transcript) {
+						applyTranscriptDelta(session, event.turn.role, event.turn.transcript);
+					}
+					break;
+				case "turn.delta": {
+					const role = session.turnRoles.get(event.turnId);
+					if (role) applyTranscriptDelta(session, role, event.delta);
+					break;
+				}
 				case "turn.done":
+					if (event.turn.id) session.turnRoles.delete(event.turn.id);
 					applyTranscriptFinal(session, event.turn.role, event.turn.transcript);
 					break;
 				case "delegation.created": {
@@ -656,7 +698,8 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 			}
 			throw new LiveSessionError(502, "connect_failed", error instanceof Error ? error.message : "Failed to connect Live Voice.");
 		}
-
+		session.connected = true;
+		maybeSeedSessionContext();
 		const sdpAnswer = transport.sdpAnswer;
 		if (!sdpAnswer) {
 			await session.stop();

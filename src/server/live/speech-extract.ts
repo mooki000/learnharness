@@ -599,9 +599,29 @@ function extractActivePrompt(messages: readonly LhMessage[]): { activePrompt?: s
 
 export interface LiveSessionContextSnapshot {
 	planSummary?: string;
+	planTitles?: string;
+	compactMemory?: string;
 	recentTurns?: string;
 	activePrompt?: string;
 	hasPendingQuestion: boolean;
+}
+
+function extractPlanTitles(tree: PlanTree | undefined, messages: readonly LhMessage[]): string | undefined {
+	let titles: string[] = [];
+	if (tree && tree.nodes.length > 0) {
+		titles = tree.nodes.map((node) => collapseInline(node.title)).filter(Boolean);
+	} else {
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const message = messages[i]!;
+			if (message.role !== "custom" || message.customType !== "plan-block") continue;
+			const parsed = PlanBlockMarkerSchema.safeParse(message.details);
+			if (!parsed.success || parsed.data.block.nodes.length === 0) continue;
+			titles = parsed.data.block.nodes.map((node) => collapseInline(node.title)).filter(Boolean);
+			break;
+		}
+	}
+	if (titles.length === 0) return undefined;
+	return titles.slice(0, MAX_PLAN_NODES).map((title, i) => `${i + 1}. ${title}`).join("; ");
 }
 
 /** Build a compact, spoiler-free snapshot of the session plan, recent turns, and active prompt for Live connect. */
@@ -610,10 +630,14 @@ export function extractLiveSessionContext(record: {
 	tree?: PlanTree;
 }): LiveSessionContextSnapshot {
 	const planSummary = extractPlanSummary(record.tree, record.messages);
+	const planTitles = extractPlanTitles(record.tree, record.messages);
+	const compactMemory = buildCompactLiveMemorySummary(record) || undefined;
 	const recentTurns = extractRecentTurns(record.messages);
 	const { activePrompt, hasPendingQuestion } = extractActivePrompt(record.messages);
 	return {
 		...(planSummary ? { planSummary } : {}),
+		...(planTitles ? { planTitles } : {}),
+		...(compactMemory ? { compactMemory } : {}),
 		...(recentTurns ? { recentTurns } : {}),
 		...(activePrompt ? { activePrompt } : {}),
 		hasPendingQuestion,
