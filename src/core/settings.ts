@@ -378,6 +378,10 @@ export interface AgentSettings {
 	 *  route); the switch is explicit so users keep a file on disk but run
 	 *  the source default to compare (owner decision 2026-09-19). */
 	prompts?: Record<string, boolean>;
+	/** Optional custom instructions appended to Live Voice sessions (e.g.
+	 *  target-language rules, pacing, or how to follow the lesson plan).
+	 *  Absent = default Live Voice tutor instructions only. */
+	livePrompt?: string;
 	/** Optional learner-source boundary, OFF when absent. ON with no folders
 	 *  refuses all learner-source reads. Paths are absolute or ~/ anchored;
 	 *  the current policy is read per new tool call/job start. Existing
@@ -385,6 +389,8 @@ export interface AgentSettings {
 	fileAccess?: FileAccessSettings;
 }
 
+/** Upper bound for custom Live Voice instructions (keeps WebRTC signaling payloads bounded). */
+export const LIVE_PROMPT_MAX_CHARS = 8_000;
 /** Markdown-rendering knobs — the bare-bones set (owner decision). */
 export interface MdRenderingSettings {
 	/** Heading font weight (100–900, default 900). CSS resolves the nearest
@@ -775,6 +781,13 @@ function sanitizeAgent(raw: Record<string, unknown>): AgentSettings {
 	if (tools) out.tools = tools;
 	const prompts = sanitizeBooleanMap(raw.prompts);
 	if (prompts) out.prompts = prompts;
+	if (typeof raw.livePrompt === "string") {
+		const trimmed = raw.livePrompt.trim();
+		if (trimmed) {
+			const chars = Array.from(trimmed);
+			out.livePrompt = chars.length > LIVE_PROMPT_MAX_CHARS ? chars.slice(0, LIVE_PROMPT_MAX_CHARS).join("") : trimmed;
+		}
+	}
 	// Search preference: lenient read side (an unknown engine id drops;
 	// the write side's parser is strict — a stale client can't brick the
 	// record, it just loses the pin and auto-detection resumes).

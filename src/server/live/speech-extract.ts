@@ -289,12 +289,13 @@ export function resolveSpokenInput(messages: readonly LhMessage[], spokenText: s
 	};
 }
 
-const MAX_PLAN_NODES = 20;
-const MAX_PLAN_SUMMARY_CHARS = 1_800;
+const MAX_PLAN_NODES = 24;
+const MAX_PLAN_SUMMARY_CHARS = 3_200;
 const MAX_PLAN_NODE_SUMMARY_CHARS = 120;
-const MAX_RECENT_TURNS = 6;
+const MAX_RECENT_TURNS = 12;
 const MAX_TURN_CHARS = 500;
-const MAX_RECENT_TOTAL_CHARS = 2_600;
+const MAX_RECENT_TOTAL_CHARS = 4_500;
+const MAX_OPENING_TURN_CHARS = 240;
 const MAX_ACTIVE_PROMPT_CHARS = 900;
 
 const PlanBlockMarkerSchema = z.object({
@@ -542,6 +543,14 @@ function extractRecentTurns(messages: readonly LhMessage[]): string | undefined 
 		if (kept.length > 0 && totalChars + formatted.length + 2 > MAX_RECENT_TOTAL_CHARS) break;
 		kept.unshift(formatted);
 		totalChars += formatted.length + 2;
+	}
+	const omitted = entries.length - kept.length;
+	if (omitted > 0) {
+		const firstLearner = entries.slice(0, omitted).find((entry) => entry.speaker === "Learner");
+		const anchor = firstLearner
+			? `Session start (${omitted} earlier ${omitted === 1 ? "turn" : "turns"} before recent window) — Learner: ${truncateCodepoints(firstLearner.text, MAX_OPENING_TURN_CHARS)}`
+			: `(${omitted} earlier ${omitted === 1 ? "turn" : "turns"} before recent window)`;
+		kept.unshift(anchor);
 	}
 	return kept.length > 0 ? kept.join("\n\n") : undefined;
 }

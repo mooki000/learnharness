@@ -115,6 +115,17 @@ describe("parseAgentSettingsBody", () => {
 		assert.equal(parseAgentSettingsBody({ graphTools: null }).ok, false);
 	});
 
+	it("livePrompt: trims non-empty strings, drops blank strings, and rejects non-strings or overly long text", () => {
+		const ok = parseAgentSettingsBody({ livePrompt: "  Speak Japanese and English naturally.  " });
+		assert.ok(ok.ok);
+		assert.equal(ok.settings.livePrompt, "Speak Japanese and English naturally.");
+		const cleared = parseAgentSettingsBody({ livePrompt: "   " });
+		assert.ok(cleared.ok);
+		assert.equal(cleared.settings.livePrompt, undefined);
+		assert.equal(parseAgentSettingsBody({ livePrompt: 123 }).ok, false);
+		assert.equal(parseAgentSettingsBody({ livePrompt: "あ".repeat(8_001) }).ok, false);
+	});
+
 	it("an empty {} agent section parses to {} (replace-whole clear)", () => {
 		const r = parseAgentSettingsBody({});
 		assert.ok(r.ok);

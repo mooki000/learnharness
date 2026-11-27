@@ -14,7 +14,7 @@ import { describe, it } from "node:test";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup as renderStatic } from "react-dom/server";
 import { InteractionLayersProvider } from "../components/interaction-layers.tsx";
-import { TOGGLE_TOOLS, AgentSection } from "../components/settings/agent-section.tsx";
+import { TOGGLE_TOOLS, AgentSection, composeLivePrompt } from "../components/settings/agent-section.tsx";
 import { AppearanceSection, GraphSection } from "../components/settings/appearance-section.tsx";
 import { AppearanceProvider } from "../components/settings/appearance.tsx";
 import { BUILTIN_THEMES, resolveTheme, THEME_COLOR_KEYS, type AppearanceSettings, type Theme } from "../src/core/index.ts";
@@ -141,12 +141,12 @@ describe("Providers settings-label typography", () => {
 	it("only Providers subscription labels use sans; setup labels retain their compact mono styling", () => {
 		const settings = renderToStaticMarkup(<SubscriptionConnections />);
 		const setup = renderToStaticMarkup(<SubscriptionConnections setup />);
-		for (const label of ["ChatGPT", "GitHub Copilot", "Grok"]) {
+		for (const label of ["ChatGPT", "GitHub Copilot", "Grok", "Claude", "OpenAI Codex"]) {
 			assert.ok(settings.includes(`<span class="font-prose text-(length:--lh-prose-size) text-foreground">${label}</span>`), `${label}: settings sans label`);
 			assert.ok(setup.includes(`<span class="font-ui text-xs text-foreground">${label}</span>`), `${label}: unchanged setup label`);
 		}
-		assert.equal((settings.match(/>Connect<\/button>/g) ?? []).length, 3);
-		assert.equal((setup.match(/>Connect<\/button>/g) ?? []).length, 3);
+		assert.equal((settings.match(/>Connect<\/button>/g) ?? []).length, 5);
+		assert.equal((setup.match(/>Connect<\/button>/g) ?? []).length, 5);
 	});
 });
 
@@ -298,6 +298,36 @@ describe("AgentSection (thin SSR)", () => {
 	it("prompts show the loading state under SSR (effects never fire)", () => {
 		const html = renderToStaticMarkup(<AgentSection agent={undefined} models={undefined} graph={undefined} onSectionChange={() => true} onModelsChange={() => {}} />);
 		assert.ok(html.includes("Loading prompt segments"));
+	});
+
+	it("renders Live Voice custom instructions editor and composes save/clear/limit cleanly", () => {
+		const html = renderToStaticMarkup(
+			<AgentSection
+				agent={{ livePrompt: "Use Japanese and English naturally." }}
+				models={undefined}
+				graph={undefined}
+				onSectionChange={() => true}
+				onModelsChange={() => {}}
+			/>,
+		);
+		assert.ok(html.includes('data-testid="group-live-voice"'));
+		assert.ok(html.includes('data-testid="input-live-prompt"'));
+		assert.ok(html.includes("Use Japanese and English naturally."));
+
+		const set = composeLivePrompt({ tools: { demo: false } }, "  Follow the Japanese plan.  ");
+		assert.equal(set.ok, true);
+		if (set.ok) {
+			assert.equal(set.settings.livePrompt, "Follow the Japanese plan.");
+			assert.deepEqual(set.settings.tools, { demo: false });
+		}
+		const cleared = composeLivePrompt({ livePrompt: "old", tools: { demo: false } }, "   ");
+		assert.equal(cleared.ok, true);
+		if (cleared.ok) {
+			assert.equal(cleared.settings.livePrompt, undefined);
+			assert.deepEqual(cleared.settings.tools, { demo: false });
+		}
+		const tooLong = composeLivePrompt(undefined, "x".repeat(8_001));
+		assert.equal(tooLong.ok, false);
 	});
 });
 

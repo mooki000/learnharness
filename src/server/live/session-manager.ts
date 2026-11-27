@@ -3,6 +3,7 @@ import {
 	DEFAULT_LIVE_VOICE,
 	LIVE_VOICES,
 	isLiveVoice,
+	upsertLiveTranscript,
 	type LiveAvailability,
 	type LiveClientEvent,
 	type LivePhase,
@@ -27,7 +28,7 @@ import {
 import { handleChatInput } from "../chat-handler.ts";
 import { prepareAndSteerChat } from "../jobs.ts";
 import { sideChats } from "../side-chat.ts";
-import { stores } from "../stores.ts";
+import { effectiveSettings, stores } from "../stores.ts";
 import { isTurnRunning } from "../turn-liveness.ts";
 import { runningTurn } from "../turn-runs.ts";
 import {
@@ -71,6 +72,7 @@ export interface LiveSessionDeps {
 	getChat: (chatId: string) => { id: string; title?: string; kind?: string; tree?: PlanTree; messages: LhMessage[] } | null;
 	runChatInput: (chatId: string, input: ChatInput) => Promise<Response>;
 	askSideQuestion?: (chatId: string, text: string, anchorMessageId: string) => Promise<Response>;
+	getLivePrompt?: () => string | undefined;
 	steerChat: (chatId: string, text: string) => Promise<"accepted" | "settled" | "stale">;
 	isRunning: (chatId: string) => boolean;
 	getRunningTurn: (chatId: string) => { subscribe(): ReadableStream<Uint8Array> } | undefined;
@@ -107,6 +109,7 @@ interface ManagedLiveSession {
 	assistantFinal: boolean;
 	assistantTurn: number;
 	lastTranscript?: LiveTranscriptEntry;
+	transcriptHistory: LiveTranscriptEntry[];
 	subscribers: Set<(event: LiveClientEvent) => void>;
 	detachTimer?: ReturnType<typeof setTimeout>;
 	releaseAbort?: () => void;
@@ -211,9 +214,15 @@ async function consumeSideNdjson(stream: ReadableStream<Uint8Array>): Promise<{ 
 function buildPendingFallbackContext(
 	record: { messages: readonly LhMessage[]; tree?: PlanTree },
 	baseHint: string,
+	sideError?: string,
 ): string {
 	const ctx = extractLiveSessionContext(record);
 	const parts = [baseHint];
+	if (sideError?.trim()) {
+		parts.push(
+			`Note: The tutor model returned an error while handling this side question (${sideError.trim()}). Briefly mention this error if helpful, and answer what you can from the session context below without revealing quiz answers.`,
+		);
+	}
 	if (ctx.planSummary) parts.push(`Lesson plan overview:\n${ctx.planSummary}`);
 	if (ctx.recentTurns) parts.push(`Recent conversation:\n${ctx.recentTurns}`);
 	return parts.join("\n\n");
@@ -267,10 +276,11 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 			session.assistantText = trimmed;
 			session.assistantFinal = final;
 		}
-		const prev = session.lastTranscript;
-		if (prev && prev.role === role && prev.turn === turn && prev.text === trimmed && prev.final === final) return;
+		const existing = session.transcriptHistory.find((item) => item.role === role && item.turn === turn);
+		if (existing && existing.text === trimmed && existing.final === final) return;
 		const entry: LiveTranscriptEntry = { role, turn, text: trimmed, final };
 		session.lastTranscript = entry;
+		session.transcriptHistory = upsertLiveTranscript(session.transcriptHistory, entry);
 		emitEvent(session, { type: "transcript", entry });
 	}
 
@@ -325,28 +335,31 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 		chatId: string,
 		record: { messages: readonly LhMessage[]; tree?: PlanTree },
 		text: string,
-	): Promise<string | null> {
-		if (!deps.askSideQuestion) return null;
+	): Promise<{ text?: string; error?: string }> {
+		if (!deps.askSideQuestion) return {};
 		const anchorId = sideSegmentId(record.messages);
 		if (!anchorId) {
 			logLiveDiagnostic(`[live] side-question skipped (${chatId}): no-segment`);
-			return null;
+			return {};
 		}
 		try {
 			const response = await deps.askSideQuestion(chatId, text, anchorId);
 			if (!response.ok || !response.body) {
-				logLiveDiagnostic(`[live] side-question failed (${chatId}): status=${response.status}`);
-				return null;
+				const error = await extractErrorFromResponse(response);
+				logLiveDiagnostic(`[live] side-question failed (${chatId}): status=${response.status} error=${error.slice(0, 120)}`);
+				return { error };
 			}
 			const result = await consumeSideNdjson(response.body);
 			if (!result.text?.trim()) {
-				logLiveDiagnostic(`[live] side-question empty (${chatId}): hasError=${Boolean(result.error)}`);
-				return null;
+				logLiveDiagnostic(
+					`[live] side-question empty (${chatId}): hasError=${Boolean(result.error)}${result.error ? ` error=${result.error.slice(0, 120)}` : ""}`,
+				);
+				return result.error ? { error: result.error } : {};
 			}
-			return result.text.trim();
+			return { text: result.text.trim() };
 		} catch {
 			logLiveDiagnostic(`[live] side-question threw (${chatId})`);
-			return null;
+			return {};
 		}
 	}
 
@@ -388,16 +401,17 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 			}
 
 			if (pendingPluginQuestionOf(recordBefore.messages)) {
-				const sideAnswer = await answerViaSideChat(session.chatId, recordBefore, text);
-				if (sideAnswer) {
+				const sideResult = await answerViaSideChat(session.chatId, recordBefore, text);
+				if (sideResult.text) {
 					logLiveDiagnostic(`[live] delegation (${session.chatId}): route=side-question (plugin-pending)`);
-					await sendDelegationText(session, delegationItemId, formatAgentFinalMessage(sideAnswer));
+					await sendDelegationText(session, delegationItemId, formatAgentFinalMessage(sideResult.text));
 					return;
 				}
 				logLiveDiagnostic(`[live] delegation (${session.chatId}): route=plugin-fallback`);
 				const fallback = buildPendingFallbackContext(
 					recordBefore,
 					"There is an interactive question card waiting on screen. Answer any clarifying or lesson-plan question using the session context below without revealing answers, and remind the learner to complete or dismiss the card on screen.",
+					sideResult.error,
 				);
 				await sendDelegationText(session, delegationItemId, formatAgentFinalMessage(fallback));
 				return;
@@ -405,17 +419,17 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 
 			const resolution = resolveSpokenInput(recordBefore.messages, text);
 			if (resolution.kind === "quiz-unmatched") {
-				const sideAnswer = await answerViaSideChat(session.chatId, recordBefore, text);
-				if (sideAnswer) {
+				const sideResult = await answerViaSideChat(session.chatId, recordBefore, text);
+				if (sideResult.text) {
 					logLiveDiagnostic(`[live] delegation (${session.chatId}): route=side-question (quiz-open)`);
-					await sendDelegationText(session, delegationItemId, formatAgentFinalMessage(sideAnswer));
+					await sendDelegationText(session, delegationItemId, formatAgentFinalMessage(sideResult.text));
 					return;
 				}
 				logLiveDiagnostic(`[live] delegation (${session.chatId}): route=quiz-fallback`);
 				await sendDelegationText(
 					session,
 					delegationItemId,
-					formatAgentFinalMessage(buildPendingFallbackContext(recordBefore, resolution.promptHint)),
+					formatAgentFinalMessage(buildPendingFallbackContext(recordBefore, resolution.promptHint, sideResult.error)),
 				);
 				return;
 			}
@@ -499,9 +513,11 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 		const freshRecord = deps.getChat(params.chatId) ?? record;
 		const liveId = randomUUID();
 		const sessionContext = extractLiveSessionContext(freshRecord);
+		const customInstructions = deps.getLivePrompt?.()?.trim() || undefined;
 		const instructions = buildTutorLiveInstructions({
 			sessionTitle: freshRecord.title,
 			sessionKind: freshRecord.kind,
+			customInstructions,
 			...sessionContext,
 		});
 		const sessionAbort = new AbortController();
@@ -522,6 +538,7 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 			assistantText: "",
 			assistantFinal: false,
 			assistantTurn: 0,
+			transcriptHistory: [],
 			subscribers: new Set(),
 			releaseAbort: () => {
 				codexWatcher?.controller.signal.removeEventListener("abort", onCodexAbort);
@@ -552,7 +569,7 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 			switch (event.type) {
 				case "session.started":
 					logLiveDiagnostic(
-						`[live] started (${params.chatId}, remote=${event.session.id}, sentInstr=${instructions.length}, echoedInstr=${event.session.instructions?.length ?? -1}, plan=${sessionContext.planSummary?.length ?? 0}, recent=${sessionContext.recentTurns?.length ?? 0}, active=${sessionContext.activePrompt?.length ?? 0})`,
+						`[live] started (${params.chatId}, remote=${event.session.id}, sentInstr=${instructions.length}, echoedInstr=${event.session.instructions?.length ?? -1}, customInstr=${customInstructions?.length ?? 0}, plan=${sessionContext.planSummary?.length ?? 0}, recent=${sessionContext.recentTurns?.length ?? 0}, active=${sessionContext.activePrompt?.length ?? 0})`,
 					);
 					if (!session.activeDelegationId) setPhase(session, "listening");
 					break;
@@ -651,8 +668,8 @@ export function createLiveSessionManager(deps: LiveSessionDeps): LiveSessionMana
 				listener = send;
 				session.subscribers.add(send);
 				send({ type: "phase", phase: session.phase });
-				if (session.lastTranscript) {
-					send({ type: "transcript", entry: session.lastTranscript });
+				for (const entry of session.transcriptHistory) {
+					send({ type: "transcript", entry });
 				}
 				if (session.ended) {
 					send({ type: "ended", ...(session.endError ? { error: session.endError } : {}) });
@@ -704,6 +721,7 @@ function defaultDeps(): LiveSessionDeps {
 			text,
 			quotes: [],
 		}),
+		getLivePrompt: () => effectiveSettings().agent.livePrompt ?? undefined,
 		steerChat: (chatId, text) => prepareAndSteerChat(chatId, { type: "steer", id: `steer_${randomUUID()}`, text }),
 		isRunning: (chatId) => isTurnRunning(chatId),
 		getRunningTurn: (chatId) => runningTurn(chatId),

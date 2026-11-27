@@ -64,6 +64,7 @@ import { PromptSegmentRow, promptSegmentName } from "./prompt-segment-row";
 import type React from "react";
 import {
 	COMPACTION_THRESHOLD_FLOOR,
+	LIVE_PROMPT_MAX_CHARS,
 	MODEL_SLOTS,
 	SEARCH_ENGINES,
 	resolveSettings,
@@ -310,6 +311,24 @@ export function composePromptSwitch(agent: AgentSettings | undefined, path: stri
 	return { ...agent, prompts };
 }
 
+/** Compose: Live Voice custom instructions. Empty clears the field; values
+ *  above LIVE_PROMPT_MAX_CHARS return an error without writing. Pure — tests. */
+export function composeLivePrompt(
+	agent: AgentSettings | undefined,
+	value: string,
+): { ok: true; settings: AgentSettings } | { ok: false; error: string } {
+	const trimmed = value.trim();
+	if (Array.from(trimmed).length > LIVE_PROMPT_MAX_CHARS) {
+		return { ok: false, error: `Keep Live Voice instructions under ${LIVE_PROMPT_MAX_CHARS.toLocaleString()} characters.` };
+	}
+	if (!trimmed) {
+		const next: AgentSettings = { ...agent };
+		delete next.livePrompt;
+		return { ok: true, settings: next };
+	}
+	return { ok: true, settings: { ...agent, livePrompt: trimmed } };
+}
+
 /** The collapsed select look (owner: "the look of the collapsed menu is
  *  good") — now a button that opens the shared model-picker dropdown. */
 function MenuTrigger({
@@ -353,6 +372,116 @@ function MenuTrigger({
 		/>
 	);
 	return hint ? <Hint label={hint}>{button}</Hint> : button;
+}
+
+function LivePromptField({
+	saved,
+	notice,
+	onSave,
+	onClearNotice,
+}: {
+	saved: string;
+	notice: string | null;
+	onSave: (next: string) => Promise<string | null>;
+	onClearNotice: () => void;
+}) {
+	const [draft, setDraft] = useState(saved);
+	const [saving, setSaving] = useState(false);
+	const [error, setError] = useState<string | null>(null);
+	const trimmed = draft.trim();
+	const charCount = Array.from(trimmed).length;
+	const overLimit = charCount > LIVE_PROMPT_MAX_CHARS;
+	const dirty = trimmed !== saved;
+
+	const commit = async (value: string) => {
+		if (saving) return;
+		setSaving(true);
+		setError(null);
+		try {
+			const err = await onSave(value);
+			if (err) setError(err);
+		} finally {
+			setSaving(false);
+		}
+	};
+
+	return (
+		<div className="flex flex-col gap-2" data-testid="live-prompt-row">
+			<div className="flex flex-col gap-0.5">
+				<label htmlFor="live-voice-custom-prompt" className="font-prose text-(length:--lh-prose-size) text-foreground">
+					Custom instructions
+				</label>
+				<p className="text-xs text-muted-foreground">
+					Extra rules appended to Live Voice sessions (language mix, pacing, or how to use the lesson plan). Applies on the next Live Voice start.
+				</p>
+			</div>
+			<textarea
+				id="live-voice-custom-prompt"
+				data-testid="input-live-prompt"
+				aria-label="Live Voice custom instructions"
+				rows={4}
+				value={draft}
+				disabled={saving}
+				placeholder="Example: Mainly used for Japanese learning. Follow the lesson plan, mix Japanese and English naturally where helpful, and explain grammar clearly when asked."
+				onChange={(event) => {
+					setDraft(event.target.value);
+					setError(null);
+					onClearNotice();
+				}}
+				onKeyDown={(event) => {
+					if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && dirty && !overLimit) {
+						event.preventDefault();
+						void commit(draft);
+					}
+				}}
+				className="min-h-24 w-full resize-y rounded-sm border border-border bg-background px-2.5 py-2 font-prose text-sm text-foreground placeholder:text-muted-foreground/60 focus:border-foreground/40 focus:outline-none disabled:opacity-50"
+			/>
+			<div className="flex flex-wrap items-center gap-2">
+				<Button
+					type="button"
+					size="xs"
+					data-testid="save-live-prompt"
+					disabled={saving || !dirty || overLimit}
+					onClick={() => void commit(draft)}
+				>
+					{saving ? "Saving…" : "Save"}
+				</Button>
+				{(saved.length > 0 || draft.length > 0) && (
+					<Button
+						type="button"
+						size="xs"
+						variant="outline"
+						data-testid="clear-live-prompt"
+						disabled={saving || (!saved && !draft)}
+						onClick={() => {
+							setError(null);
+							if (saved) void commit("");
+							else { setDraft(""); onClearNotice(); }
+						}}
+					>
+						Clear
+					</Button>
+				)}
+				{error ? (
+					<p role="alert" data-testid="live-prompt-error" className="text-xs text-error">
+						{error}
+					</p>
+				) : overLimit ? (
+					<p role="alert" data-testid="live-prompt-error" className="text-xs text-error">
+						{charCount.toLocaleString()} / {LIVE_PROMPT_MAX_CHARS.toLocaleString()} characters
+					</p>
+				) : notice ? (
+					<p role="status" data-testid="live-prompt-status" className="text-xs text-muted-foreground">
+						{notice}
+					</p>
+				) : charCount > 0 ? (
+					<span className="ml-auto font-ui text-[11px] text-muted-foreground/70">
+						{charCount.toLocaleString()} / {LIVE_PROMPT_MAX_CHARS.toLocaleString()}
+					</span>
+				) : null}
+			</div>
+		</div>
+	);
 }
 
 /* The section's dropdowns all mount the shared MenuShell (fix wave chunk
@@ -416,9 +545,9 @@ export function AgentSection({
 	const [openMenu, setOpenMenu] = useState<{ target: ModelSlotName | "search"; kind: "model" | "thinking" | "engine" | "cache" } | null>(null);
 	const [advancedModels, setAdvancedModels] = useState(false);
 	const [workerConcurrencyError, setWorkerConcurrencyError] = useState<string | null>(null);
+	const [livePromptNotice, setLivePromptNotice] = useState<string | null>(null);
 	const menuAnchorRef = useRef<HTMLSpanElement>(null);
 	const interactions = useInteractionLayers();
-
 	const refreshSearch = () =>
 		fetch("/api/search")
 			.then((r) => r.json())
@@ -993,6 +1122,23 @@ export function AgentSection({
 						))}
 					</div>
 				)}
+			</SettingsGroup>
+
+			<SettingsGroup label="Live Voice" testid="group-live-voice">
+				<LivePromptField
+					key={agent?.livePrompt ?? ""}
+					saved={agent?.livePrompt ?? ""}
+					notice={livePromptNotice}
+					onClearNotice={() => setLivePromptNotice(null)}
+					onSave={async (next) => {
+						const composed = composeLivePrompt(latestAgent.current, next);
+						if (!composed.ok) return composed.error;
+						const accepted = await onSectionChange(composed.settings);
+						if (!accepted) return "Couldn't save Live Voice instructions.";
+						setLivePromptNotice(composed.settings.livePrompt ? "Saved." : "Cleared.");
+						return null;
+					}}
+				/>
 			</SettingsGroup>
 			{openSegment && <PromptSegmentDialog
 				name={promptSegmentName(openSegment.info.path)} returnFocusFallback={openSegment.row} source={openSegment.info.sourceText} override={openSegment.info.overrideText} mode={openSegment.mode}

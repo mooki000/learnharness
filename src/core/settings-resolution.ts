@@ -83,8 +83,9 @@ export interface EffectiveSettings {
 		tools: Record<string, boolean>;
 		/** Delta map as stored — absent key → override off. */
 		prompts: Record<string, boolean>;
+		/** Optional custom instructions for Live Voice sessions; null when unset. */
+		livePrompt: string | null;
 		/** The search-engine preference as stored (search wave, 2026-09-20):
-		 *  passthrough delta — engine resolution (pin → auto → unavailable)
 		 *  lives in server/search.ts, where keys are visible. */
 		search: { engine?: SearchEngineId };
 		/** Prober graph tools (wave 7): passthrough delta as stored —
@@ -209,6 +210,7 @@ export function resolveSettings(record: UserSettings | null): EffectiveSettings 
 			models,
 			tools: agent.tools ?? {},
 			prompts: agent.prompts ?? {},
+			livePrompt: agent.livePrompt ?? null,
 			search: agent.search ?? {},
 			graphTools: agent.graphTools ?? {},
 		},

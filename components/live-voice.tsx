@@ -1,11 +1,12 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AudioLinesIcon, CheckIcon, ChevronDownIcon, Loader2Icon, MicIcon, MicOffIcon, SquareIcon, XIcon } from "lucide-react";
+import { AudioLinesIcon, CheckIcon, ChevronDownIcon, ChevronUpIcon, CopyIcon, Loader2Icon, MicIcon, MicOffIcon, SquareIcon, XIcon } from "lucide-react";
 import {
 	DEFAULT_LIVE_VOICE,
 	LIVE_VOICES,
 	isLiveVoice,
+	upsertLiveTranscript,
 	type LiveAvailability,
 	type LiveClientEvent,
 	type LivePhase,
@@ -32,12 +33,14 @@ export interface LiveVoiceController {
 	muted: boolean;
 	voice: LiveVoiceId;
 	transcript: LiveTranscriptEntry | null;
+	transcriptHistory: readonly LiveTranscriptEntry[];
 	error: string | null;
 	setVoice: (voice: LiveVoiceId) => void;
 	start: () => Promise<void>;
 	stop: () => Promise<void>;
 	toggleMute: () => void;
 	clearError: () => void;
+	clearTranscript: () => void;
 }
 
 function readStoredVoice(): LiveVoiceId {
@@ -116,9 +119,11 @@ export function useLiveVoice({
 	const [speaking, setSpeaking] = useState(false);
 	const [muted, setMuted] = useState(false);
 	const [voice, setVoiceState] = useState<LiveVoiceId>(DEFAULT_LIVE_VOICE);
-	const [transcript, setTranscript] = useState<LiveTranscriptEntry | null>(null);
+	const [historyState, setHistoryState] = useState<{ chatId: string; entries: LiveTranscriptEntry[] }>(() => ({
+		chatId,
+		entries: [],
+	}));
 	const [error, setError] = useState<string | null>(null);
-
 	const pcRef = useRef<RTCPeerConnection | null>(null);
 	const streamRef = useRef<MediaStream | null>(null);
 	const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -204,7 +209,6 @@ export function useLiveVoice({
 		teardownLocal();
 		setServerPhase("idle");
 		setMuted(false);
-		setTranscript(null);
 		if (activeId) {
 			try {
 				await fetch(`/api/chats/${encodeURIComponent(chatId)}/live?liveId=${encodeURIComponent(activeId)}`, {
@@ -265,7 +269,7 @@ export function useLiveVoice({
 		startingRef.current = true;
 		const gen = ++generationRef.current;
 		setError(null);
-		setTranscript(null);
+		setHistoryState({ chatId, entries: [] });
 		setMuted(false);
 		setServerPhase("connecting");
 		try {
@@ -350,7 +354,10 @@ export function useLiveVoice({
 					if (event.type === "phase") {
 						setServerPhase(event.phase);
 					} else if (event.type === "transcript") {
-						setTranscript(event.entry);
+						setHistoryState((prev) => ({
+							chatId,
+							entries: upsertLiveTranscript(prev.chatId === chatId ? prev.entries : [], event.entry),
+						}));
 					} else if (event.type === "error") {
 						setError(event.message);
 					} else if (event.type === "ended") {
@@ -392,6 +399,12 @@ export function useLiveVoice({
 	}, []);
 
 	const clearError = useCallback(() => setError(null), []);
+	const clearTranscript = useCallback(() => {
+		setHistoryState({ chatId, entries: [] });
+	}, [chatId]);
+
+	const transcriptHistory = historyState.chatId === chatId ? historyState.entries : [];
+	const transcript = transcriptHistory.at(-1) ?? null;
 
 	const active = serverPhase !== "idle";
 	const effectivePhase: LivePhase = !active
@@ -413,12 +426,14 @@ export function useLiveVoice({
 		muted,
 		voice,
 		transcript,
+		transcriptHistory,
 		error,
 		setVoice,
 		start,
 		stop,
 		toggleMute,
 		clearError,
+		clearTranscript,
 	};
 }
 
@@ -568,55 +583,164 @@ export function LiveVoiceBar({ live, disabled = false }: { live: LiveVoiceContro
 	);
 }
 
+export function formatLiveTranscriptText(entries: readonly LiveTranscriptEntry[]): string {
+	return entries
+		.map((entry) => `${entry.role === "user" ? "You" : "Tutor"}: ${entry.text}`)
+		.join("\n\n");
+}
+
 export function LiveCaptionStrip({ live }: { live: LiveVoiceController }) {
-	if (!live.active) {
-		if (!live.error) return null;
-		return (
-			<div
-				role="alert"
-				data-testid="live-error-strip"
-				className="pointer-events-auto mb-2 flex items-center gap-2 rounded-xl border border-destructive/40 bg-card/90 px-3 py-1.5 text-xs text-destructive shadow-sm backdrop-blur"
-			>
-				<AudioLinesIcon className="size-3.5 shrink-0" />
-				<p className="min-w-0 flex-1 break-words">{live.error}</p>
-				<button
-					type="button"
-					onClick={live.clearError}
-					aria-label="Dismiss live voice error"
-					className="flex size-5 shrink-0 items-center justify-center rounded text-destructive/80 transition-colors hover:bg-destructive/10 hover:text-destructive"
-				>
-					<XIcon className="size-3" />
-				</button>
-			</div>
-		);
-	}
-	const { transcript, phase } = live;
+	const [collapsed, setCollapsed] = useState(false);
+	const [copied, setCopied] = useState(false);
+	const listRef = useRef<HTMLDivElement>(null);
+	const copyTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+	const { transcript, transcriptHistory, phase, active, error } = live;
+	const hasHistory = transcriptHistory.length > 0;
+	const showTranscriptBody = hasHistory && !collapsed;
+
+	useEffect(() => {
+		return () => {
+			if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+		};
+	}, []);
+
+	useEffect(() => {
+		if (!showTranscriptBody) return;
+		const el = listRef.current;
+		if (!el) return;
+		const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+		if (distanceFromBottom < 80) {
+			el.scrollTop = el.scrollHeight;
+		}
+	}, [showTranscriptBody, transcriptHistory]);
+
+	const handleCopy = () => {
+		if (!hasHistory || typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
+		void navigator.clipboard.writeText(formatLiveTranscriptText(transcriptHistory)).then(() => {
+			setCopied(true);
+			if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+			copyTimerRef.current = setTimeout(() => setCopied(false), 1_500);
+		}).catch(() => {});
+	};
+
+	if (!active && !error && !hasHistory) return null;
+
 	return (
-		<div
-			data-testid="live-caption-strip"
-			className="pointer-events-auto mb-2 flex items-center gap-2 rounded-xl border border-border/60 bg-card/85 px-3 py-1.5 text-xs text-muted-foreground shadow-sm backdrop-blur"
-		>
-			<AudioLinesIcon className="size-3.5 shrink-0 text-foreground/70" />
-			<p className="min-w-0 flex-1 truncate">
-				{transcript ? (
-					<>
-						<span className="mr-1.5 font-medium text-foreground">
-							{transcript.role === "user" ? "You:" : "Tutor:"}
-						</span>
-						<span className="text-foreground/90">{transcript.text}</span>
-					</>
-				) : (
-					<span>
-						{phase === "connecting"
-							? "Connecting to Codex Live Voice…"
-							: phase === "working"
-								? "Tutor is preparing a reply…"
-								: phase === "muted"
-									? "Microphone muted."
-									: "Live voice active — speak naturally in English or Japanese."}
-					</span>
-				)}
-			</p>
+		<div className="pointer-events-auto mb-2 flex flex-col gap-1.5">
+			{!active && error && (
+				<div
+					role="alert"
+					data-testid="live-error-strip"
+					className="flex items-center gap-2 rounded-xl border border-destructive/40 bg-card/90 px-3 py-1.5 text-xs text-destructive shadow-sm backdrop-blur"
+				>
+					<AudioLinesIcon className="size-3.5 shrink-0" />
+					<p className="min-w-0 flex-1 break-words">{error}</p>
+					<button
+						type="button"
+						onClick={live.clearError}
+						aria-label="Dismiss live voice error"
+						className="flex size-5 shrink-0 items-center justify-center rounded text-destructive/80 transition-colors hover:bg-destructive/10 hover:text-destructive"
+					>
+						<XIcon className="size-3" />
+					</button>
+				</div>
+			)}
+			{(active || hasHistory) && (
+				<div
+					data-testid="live-caption-strip"
+					className="overflow-hidden rounded-xl border border-border/60 bg-card/90 text-xs text-muted-foreground shadow-sm backdrop-blur"
+				>
+					<div className="flex items-center gap-2 px-3 py-1.5">
+						<AudioLinesIcon className="size-3.5 shrink-0 text-foreground/70" />
+						<p className="min-w-0 flex-1 truncate">
+							{!active ? (
+								<span className="font-medium text-foreground">
+									Voice transcript ({transcriptHistory.length} {transcriptHistory.length === 1 ? "turn" : "turns"})
+								</span>
+							) : showTranscriptBody ? (
+								<span className="font-medium text-foreground">
+									Live transcript ({transcriptHistory.length})
+								</span>
+							) : transcript ? (
+								<>
+									<span className="mr-1.5 font-medium text-foreground">
+										{transcript.role === "user" ? "You:" : "Tutor:"}
+									</span>
+									<span className="text-foreground/90">{transcript.text}</span>
+								</>
+							) : (
+								<span>
+									{phase === "connecting"
+										? "Connecting to Codex Live Voice…"
+										: phase === "working"
+											? "Tutor is preparing a reply…"
+											: phase === "muted"
+												? "Microphone muted."
+												: "Live voice active — speak naturally in English or Japanese."}
+								</span>
+							)}
+						</p>
+						{hasHistory && (
+							<div className="flex shrink-0 items-center gap-1">
+								<button
+									type="button"
+									onClick={handleCopy}
+									data-testid="live-transcript-copy"
+									aria-label="Copy voice transcript"
+									className="flex h-5 items-center gap-1 rounded px-1.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+								>
+									{copied ? <CheckIcon className="size-3" /> : <CopyIcon className="size-3" />}
+									<span>{copied ? "Copied" : "Copy"}</span>
+								</button>
+								<button
+									type="button"
+									onClick={() => setCollapsed((prev) => !prev)}
+									data-testid="live-transcript-toggle"
+									aria-expanded={!collapsed}
+									aria-label={collapsed ? "Expand voice transcript" : "Collapse voice transcript"}
+									className="flex h-5 items-center gap-0.5 rounded px-1.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+								>
+									<span>{collapsed ? "Show" : "Hide"}</span>
+									{collapsed ? <ChevronUpIcon className="size-3" /> : <ChevronDownIcon className="size-3" />}
+								</button>
+								{!active && (
+									<button
+										type="button"
+										onClick={live.clearTranscript}
+										data-testid="live-transcript-dismiss"
+										aria-label="Dismiss voice transcript"
+										className="flex size-5 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+									>
+										<XIcon className="size-3" />
+									</button>
+								)}
+							</div>
+						)}
+					</div>
+					{showTranscriptBody && (
+						<div
+							ref={listRef}
+							data-testid="live-transcript-list"
+							className="max-h-48 space-y-1.5 overflow-y-auto border-t border-border/50 px-3 py-2 select-text"
+						>
+							{transcriptHistory.map((entry) => (
+								<div
+									key={`${entry.role}:${entry.turn}`}
+									data-testid={`live-transcript-entry-${entry.role}-${entry.turn}`}
+									className="flex items-baseline gap-2 leading-relaxed"
+								>
+									<span className={`shrink-0 font-ui text-[11px] font-medium ${entry.role === "user" ? "text-foreground" : "text-muted-foreground"}`}>
+										{entry.role === "user" ? "You" : "Tutor"}
+									</span>
+									<p className={`min-w-0 flex-1 whitespace-pre-wrap break-words font-prose text-xs ${entry.final ? "text-foreground/90" : "italic text-muted-foreground"}`}>
+										{entry.text}
+									</p>
+								</div>
+							))}
+						</div>
+					)}
+				</div>
+			)}
 		</div>
 	);
 }

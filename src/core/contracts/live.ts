@@ -33,6 +33,28 @@ export interface LiveTranscriptEntry {
 	final: boolean;
 }
 
+export const MAX_LIVE_TRANSCRIPT_ENTRIES = 200;
+
+/** Upsert one spoken transcript entry keyed by `(role, turn)` so streaming
+ *  deltas update the active bubble in place instead of duplicating rows. */
+export function upsertLiveTranscript(
+	history: readonly LiveTranscriptEntry[],
+	entry: LiveTranscriptEntry,
+	maxEntries: number = MAX_LIVE_TRANSCRIPT_ENTRIES,
+): LiveTranscriptEntry[] {
+	const idx = history.findIndex((item) => item.role === entry.role && item.turn === entry.turn);
+	if (idx >= 0) {
+		const existing = history[idx]!;
+		if (existing.text === entry.text && existing.final === entry.final) {
+			return [...history];
+		}
+		const next = [...history];
+		next[idx] = entry;
+		return next;
+	}
+	const next = [...history, entry];
+	return next.length > maxEntries ? next.slice(next.length - maxEntries) : next;
+}
 export interface LiveAvailability {
 	available: boolean;
 	mode: "codex" | "endpoint";

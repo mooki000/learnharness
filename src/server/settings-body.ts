@@ -28,7 +28,7 @@ import type {
 	ModelSlot,
 	RoleModelOverride,
 } from "../core/settings.ts";
-import { BACKGROUND_MODEL_ROLES, CACHE_RETENTIONS, COMPACTION_THRESHOLD_FLOOR, CUSTOM_MODEL_PIN_FLOOR, EXTRACTION_CHUNK_TOKENS_FLOOR, isTranscriptMaxWidth, MODEL_SLOTS, TRANSCRIPT_WIDTH_MAX_REM, TRANSCRIPT_WIDTH_MIN_REM } from "../core/settings.ts";
+import { BACKGROUND_MODEL_ROLES, CACHE_RETENTIONS, COMPACTION_THRESHOLD_FLOOR, CUSTOM_MODEL_PIN_FLOOR, EXTRACTION_CHUNK_TOKENS_FLOOR, isTranscriptMaxWidth, LIVE_PROMPT_MAX_CHARS, MODEL_SLOTS, TRANSCRIPT_WIDTH_MAX_REM, TRANSCRIPT_WIDTH_MIN_REM } from "../core/settings.ts";
 import { WRITABLE_TOOL_KEYS } from "../core/pending.ts";
 import { isSearchEngineId, SEARCH_ENGINES } from "../core/search.ts";
 import { isDictationLanguage } from "../core/dictation.ts";
@@ -204,6 +204,16 @@ export function parseAgentSettingsBody(body: unknown): SettingsBodyResult<AgentS
 	const prompts = parseBooleanMap(raw.prompts, "prompts");
 	if (prompts.error) return { ok: false, error: prompts.error };
 	if (prompts.map) settings.prompts = prompts.map;
+	if (raw.livePrompt !== undefined) {
+		if (typeof raw.livePrompt !== "string") {
+			return { ok: false, error: "livePrompt must be a string" };
+		}
+		const trimmed = raw.livePrompt.trim();
+		if (Array.from(trimmed).length > LIVE_PROMPT_MAX_CHARS) {
+			return { ok: false, error: `livePrompt must be at most ${LIVE_PROMPT_MAX_CHARS} characters` };
+		}
+		if (trimmed.length > 0) settings.livePrompt = trimmed;
+	}
 	if (raw.search !== undefined) {
 		const search = asRecord(raw.search);
 		if (!search) return { ok: false, error: "search must be an object" };

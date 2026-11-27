@@ -326,6 +326,7 @@ export function buildTutorLiveInstructions(context: {
 	sessionTitle?: string;
 	sessionKind?: string;
 	hasPendingQuestion?: boolean;
+	customInstructions?: string;
 	planSummary?: string;
 	recentTurns?: string;
 	activePrompt?: string;
@@ -349,6 +350,13 @@ export function buildTutorLiveInstructions(context: {
 		"Commentary context is quiet progress while you think or prepare a response; you may acknowledge active work briefly without claiming results before they arrive.",
 		'Context beginning with `"Agent Final Message":` is your finished tutor reply for the learner. Present its substance and any posed question naturally in speech as your own words, without mentioning the label.',
 	].filter(Boolean);
+	if (context.customInstructions?.trim()) {
+		sections.push(
+			"",
+			"Custom Live Voice instructions from the user (apply these preferences for language, pacing, and how to use the lesson plan, while still delegating substantive turns and never revealing unanswered quiz answers):",
+			context.customInstructions.trim(),
+		);
+	}
 	if (context.planSummary?.trim()) {
 		sections.push("", "Lesson plan overview:", context.planSummary.trim());
 	}

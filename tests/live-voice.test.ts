@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { newAnswerResult, newPlanBlockMessage, newThinkingMessage, type LhMessage } from "../src/core/native-messages.ts";
 import type { PlanTree } from "../src/core/contracts/plan.ts";
+import { upsertLiveTranscript, type LiveClientEvent, type LiveTranscriptEntry } from "../src/core/contracts/live.ts";
 import { sideChatLessonDocument } from "../src/core/side-chat.ts";
 import { questionDisplayOptions } from "../src/core/question-core.ts";
 import {
@@ -809,4 +810,199 @@ test("createLiveSessionManager includes plan and recent turns in quiz fallback w
 	assert(text.includes("ない marks negation."));
 	assert(!text.includes("SECRET"));
 	await manager.stop("chat_quiz_fb");
+});
+
+test("createLiveSessionManager injects custom Live Voice instructions from settings", async () => {
+	let capturedInstructions = "";
+	const manager = createLiveSessionManager({
+		getChat: () => ({ id: "chat_custom_prompt", title: "日本語", kind: "teach", messages: [] }),
+		runChatInput: async () => new Response("", { status: 200 }),
+		getLivePrompt: () => "Mainly used for Japanese learning. Read the plan and mix Japanese and English naturally.",
+		steerChat: async () => "stale",
+		isRunning: () => false,
+		getRunningTurn: () => undefined,
+		getEndpoint: () => undefined,
+		refreshCodex: async () => {},
+		isCodexConnected: () => true,
+		leaseCodexAuth: async () => ({ accessToken: "tok", accountId: "acct" }),
+		watchCodexAbort: () => ({ controller: new AbortController(), release: () => {} }),
+		createTransport: (options) => {
+			capturedInstructions = options.instructions;
+			return {
+				sdpAnswer: "v=0\r\n",
+				connect: async () => {},
+				send: async () => {},
+				close: async () => {},
+			};
+		},
+	});
+
+	await manager.start({ chatId: "chat_custom_prompt", sdpOffer: "v=0\r\n" });
+	assert(capturedInstructions.includes("Custom Live Voice instructions from the user"));
+	assert(capturedInstructions.includes("Mainly used for Japanese learning. Read the plan and mix Japanese and English naturally."));
+	await manager.stop("chat_custom_prompt");
+});
+
+test("extractLiveSessionContext keeps opening learner goal when history exceeds recent window", () => {
+	const messages: LhMessage[] = [
+		{ id: "u0", role: "user", content: "Teach me Japanese grammar from scratch for reading manga.", timestamp: 1 },
+	];
+	for (let i = 1; i <= 15; i++) {
+		messages.push(
+			assistantMessage([{ type: "text", text: `Lesson step ${i} explanation.` }]),
+			{ id: `u${i}`, role: "user", content: `Follow-up question ${i}.`, timestamp: i + 1 },
+		);
+	}
+	const snapshot = extractLiveSessionContext({ messages });
+	assert(snapshot.recentTurns?.includes("Session start ("));
+	assert(snapshot.recentTurns?.includes("Teach me Japanese grammar from scratch for reading manga."));
+	assert(snapshot.recentTurns?.includes("Follow-up question 15."));
+});
+
+test("createLiveSessionManager surfaces side-chat provider errors in quiz fallback context", async () => {
+	let emitWire: (event: LiveWireEvent) => void = () => {};
+	const sentFrames: { content?: { text?: string }[] }[] = [];
+	const frameSent = Promise.withResolvers<void>();
+
+	const messages: LhMessage[] = [
+		{
+			...assistantMessage([
+				{ type: "toolCall", id: "send_e", name: "send_to_user", arguments: { message: "Check verb past negative." } },
+				{
+					type: "toolCall",
+					id: "quiz_e",
+					name: "quiz",
+					arguments: {
+						type: "check",
+						nodeId: "verbs",
+						question: "Pick the reading.",
+						options: [{ label: "A", value: "a" }, { label: "B", value: "b" }],
+						correctAnswer: "a",
+						explanation: "SECRET_EXPLANATION",
+					},
+				},
+			], "toolUse"),
+			id: "msg_err_seg",
+		},
+	];
+
+	const manager = createLiveSessionManager({
+		getChat: () => ({ id: "chat_side_err", title: "日本語", messages }),
+		runChatInput: async () => new Response("", { status: 200 }),
+		askSideQuestion: async () => {
+			const ndjson = JSON.stringify({
+				type: "done",
+				thread: {
+					messages: [{ role: "assistant", text: "", error: "Claude usage limit reached." }],
+				},
+			}) + "\n";
+			return new Response(ndjson, { status: 200, headers: { "Content-Type": "application/x-ndjson" } });
+		},
+		steerChat: async () => "stale",
+		isRunning: () => false,
+		getRunningTurn: () => undefined,
+		getEndpoint: () => undefined,
+		refreshCodex: async () => {},
+		isCodexConnected: () => true,
+		leaseCodexAuth: async () => ({ accessToken: "tok", accountId: "acct" }),
+		watchCodexAbort: () => ({ controller: new AbortController(), release: () => {} }),
+		createTransport: (options) => {
+			emitWire = options.onEvent;
+			return {
+				sdpAnswer: "v=0\r\n",
+				connect: async () => {},
+				send: async (payload) => {
+					sentFrames.push(payload as { content?: { text?: string }[] });
+					frameSent.resolve();
+				},
+				close: async () => {},
+			};
+		},
+	});
+
+	await manager.start({ chatId: "chat_side_err", sdpOffer: "v=0\r\n" });
+	emitWire({
+		type: "delegation.created",
+		item: { type: "delegation", target: "client", id: "del_err_1", content: [{ type: "input_text", text: "How far back can you see?" }] },
+	});
+	await frameSent.promise;
+	const text = sentFrames[0]?.content?.[0]?.text ?? "";
+	assert(text.includes("Claude usage limit reached."));
+	assert(!text.includes("SECRET_EXPLANATION"));
+	await manager.stop("chat_side_err");
+});
+
+test("upsertLiveTranscript updates active turn in place and caps history length", () => {
+	let history: LiveTranscriptEntry[] = [];
+	history = upsertLiveTranscript(history, { role: "user", turn: 1, text: "食べ", final: false });
+	history = upsertLiveTranscript(history, { role: "user", turn: 1, text: "食べなかった", final: true });
+	history = upsertLiveTranscript(history, { role: "assistant", turn: 1, text: "That means didn't eat.", final: true });
+	assert.equal(history.length, 2);
+	assert.deepEqual(history[0], { role: "user", turn: 1, text: "食べなかった", final: true });
+	assert.deepEqual(history[1], { role: "assistant", turn: 1, text: "That means didn't eat.", final: true });
+
+	let capped: LiveTranscriptEntry[] = [];
+	for (let i = 1; i <= 5; i++) {
+		capped = upsertLiveTranscript(capped, { role: "user", turn: i, text: `Turn ${i}`, final: true }, 3);
+	}
+	assert.deepEqual(capped.map((entry) => entry.turn), [3, 4, 5]);
+});
+
+test("createLiveSessionManager accumulates transcript history and replays all turns on subscribe", async () => {
+	let emitWire: (event: LiveWireEvent) => void = () => {};
+	const manager = createLiveSessionManager({
+		getChat: () => ({ id: "chat_tr_hist", title: "日本語", messages: [] }),
+		runChatInput: async () => new Response("", { status: 200 }),
+		steerChat: async () => "stale",
+		isRunning: () => false,
+		getRunningTurn: () => undefined,
+		getEndpoint: () => undefined,
+		refreshCodex: async () => {},
+		isCodexConnected: () => true,
+		leaseCodexAuth: async () => ({ accessToken: "tok", accountId: "acct" }),
+		watchCodexAbort: () => ({ controller: new AbortController(), release: () => {} }),
+		createTransport: (options) => {
+			emitWire = options.onEvent;
+			return {
+				sdpAnswer: "v=0\r\n",
+				connect: async () => {},
+				send: async () => {},
+				close: async () => {},
+			};
+		},
+	});
+
+	const started = await manager.start({ chatId: "chat_tr_hist", sdpOffer: "v=0\r\n" });
+	emitWire({ type: "input_transcript.added", item: { text: "すみま" } });
+	emitWire({ type: "input_transcript.added", item: { text: "せん" } });
+	emitWire({ type: "turn.done", turn: { role: "user", transcript: "すみません" } });
+	emitWire({ type: "output_transcript.added", item: { text: "はい、" } });
+	emitWire({ type: "turn.done", turn: { role: "assistant", transcript: "はい、どうぞ！" } });
+
+	const stream = manager.subscribe("chat_tr_hist", started.liveId);
+	assert(stream);
+	const reader = stream.getReader();
+	const decoder = new TextDecoder();
+	let raw = "";
+	const events: LiveClientEvent[] = [];
+	while (events.length < 3) {
+		const { value, done } = await reader.read();
+		if (done) break;
+		raw += decoder.decode(value, { stream: true });
+		let idx = raw.indexOf("\n\n");
+		while (idx !== -1) {
+			const frame = raw.slice(0, idx);
+			raw = raw.slice(idx + 2);
+			const dataLine = frame.split("\n").find((line) => line.startsWith("data: "));
+			if (dataLine) events.push(JSON.parse(dataLine.slice(6)) as LiveClientEvent);
+			idx = raw.indexOf("\n\n");
+		}
+	}
+	await reader.cancel();
+	const replayed = events.filter((e): e is Extract<LiveClientEvent, { type: "transcript" }> => e.type === "transcript").map((e) => e.entry);
+	assert.deepEqual(replayed, [
+		{ role: "user", turn: 1, text: "すみません", final: true },
+		{ role: "assistant", turn: 1, text: "はい、どうぞ！", final: true },
+	]);
+	await manager.stop("chat_tr_hist");
 });

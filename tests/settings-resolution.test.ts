@@ -36,6 +36,19 @@ describe("resolveSettings", () => {
 		}
 	});
 
+	it("livePrompt defaults to null, preserves trimmed custom instructions, and clamps/drops invalid disk values", () => {
+		assert.equal(resolveSettings(null).agent.livePrompt, null);
+		assert.equal(resolveSettings({ version: 1, agent: {} }).agent.livePrompt, null);
+		const valid = sanitizeUserSettings({ version: 1, agent: { livePrompt: "  Japanese + English mix  " } });
+		assert.equal(resolveSettings(valid).agent.livePrompt, "Japanese + English mix");
+		const blank = sanitizeUserSettings({ version: 1, agent: { livePrompt: "   " } });
+		assert.equal(resolveSettings(blank).agent.livePrompt, null);
+		const bad = sanitizeUserSettings({ version: 1, agent: { livePrompt: 42 } });
+		assert.equal(resolveSettings(bad).agent.livePrompt, null);
+		const long = sanitizeUserSettings({ version: 1, agent: { livePrompt: "あ".repeat(8_100) } });
+		assert.equal(Array.from(resolveSettings(long).agent.livePrompt ?? "").length, 8_000);
+	});
+
 	it("null record (first boot): non-model knobs land on factory defaults; every model view is EMPTY", () => {
 		const eff = resolveSettings(null);
 		assert.deepEqual(eff.general, { autoUpdate: true });
